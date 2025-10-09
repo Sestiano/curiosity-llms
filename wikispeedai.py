@@ -8,7 +8,6 @@ import os
 from bs4 import BeautifulSoup
 from difflib import SequenceMatcher
 
-# Set Wikipedia language to English and suppress warnings
 wikipedia.set_lang('en')
 warnings.filterwarnings('ignore')
 
@@ -17,9 +16,9 @@ def load_config():
     """Load and validate configuration from config.json or use defaults"""
     # Default configuration values
     defaults = {
-        'start_pages': ['Vaccine', 'Philosophy', 'Ancient Rome'],
+        'start_pages': ['Vaccine', 'Philosophy'],
         'target': 'Renaissance',
-        'iterations_per_start_page': 100,
+        'iterations_per_start_page': 10,
         'temperatures': [0.3, 1.5],
         'lm_studio_url': "http://localhost:1234/v1/chat/completions",
         'fuzzy_match_threshold': 0.95,
@@ -34,11 +33,9 @@ def load_config():
     model_name = config.get('model_name', 'lm_studio')
     config['output_dir'] = model_name.replace('/', '_').replace(':', '_').replace('\\', '_')
 
-    # Normalize start_pages to always be a list
+    # Normalize start_pages (sp) and temperature (t) to always be a list
     sp = config.get('start_pages', [config.get('start_page', 'Vaccine')])
     config['start_pages'] = [sp] if isinstance(sp, str) else sp
-    
-    # Normalize temperatures to always be a list
     t = config.get('temperatures', [0.3])
     config['temperatures'] = [t] if isinstance(t, (int, float)) else t
     
@@ -50,7 +47,6 @@ start_pages = CONFIG['start_pages']
 temperatures = CONFIG['temperatures']
 iterations = CONFIG['iterations_per_start_page']
 
-# System prompt that guides the LLM navigation behavior
 SYSTEM_PROMPT = """
 You are a Large Language Model acting as a Wikipedia navigator. 
 Your goal is to reach the TARGET article by selecting every time a link.
@@ -58,8 +54,9 @@ Your goal is to reach the TARGET article by selecting every time a link.
 Rules:
 - Read the CURRENT PAGE CONTENT to understand the topic and available connections
 - Choose ONE link that brings you towards the target's webpage
-- You MUST reply ONLY with the exact link name from the available options
-
+- You MUST reply in JSON format with TWO fields:
+  * "link": the exact link name from the available options
+  * "reason": a BRIEF explanation of why you chose this link
 """
 
 def create_navigation_prompt(current_article, target_article, links, path, page_content=None):
@@ -72,7 +69,7 @@ def create_navigation_prompt(current_article, target_article, links, path, page_
     links_list = '\n'.join(links)
     
     # Include page content to help LLM make informed decisions
-    content_text = page_content if page_content else "[No content available]"
+    content_text = page_content if page_content else "[no content available]"
 
     # Build the complete prompt with all necessary information
     prompt = f""" Your TARGET page of Wikipedia is: "{target_article}" 
@@ -84,9 +81,34 @@ def create_navigation_prompt(current_article, target_article, links, path, page_
                   AVAILABLE LINKS: {links_list}
                   
                   TASK: Choose ONE link that brings you towards the target's webpage: "{target_article}".
+                  Remember to respond in JSON format with both "link" and "reason" fields.
                   """
 
     return prompt
+
+def get_lm_studio_model_name():
+    """
+    Retrieve the current model name from LM Studio API.
+    Returns the model name or 'lm_studio' as fallback.
+    """
+    try:
+        # LM Studio's /v1/models endpoint returns info about loaded models
+        models_url = CONFIG['lm_studio_url'].replace('/v1/chat/completions', '/v1/models')
+        response = requests.get(models_url, timeout=10)
+        response.raise_for_status()
+        result = response.json()
+        
+        # Get the first available model
+        if 'data' in result and len(result['data']) > 0:
+            model_name = result['data'][0].get('id', 'lm_studio')
+            print(f"Detected LM Studio model: {model_name}")
+            return model_name
+        else:
+            print("No model found in LM Studio response, using default")
+            return 'lm_studio'
+    except Exception as e:
+        print(f"Could not retrieve model name from LM Studio: {e}")
+        return 'lm_studio'
 
 def call_lm_studio(messages, temperature=0.3):
     """Call LM Studio API with the given messages and temperature setting"""
@@ -144,8 +166,7 @@ def get_page_links(page, exclude_keywords=None):
     
     # Define keywords for non-content pages to exclude
     exclude = exclude_keywords or ['Category:', 'Template:', 'File:', 'Portal:', 
-                                   'Help:', 'Wikipedia:', 'Talk:', 'Special:', 
-                                   'List of', 'Timeline of']
+                                   'Help:', 'Wikipedia:', 'Talk:', 'Special:']
     
     try:
         from urllib.parse import unquote
@@ -192,17 +213,34 @@ def fuzzy_similarity(s1, s2):
 def parse_model_choice(response, available_links, target_article=None):
     """
     Parse the model's response and match it to an available link.
+    Expects JSON format with 'link' and 'reason' fields.
     Uses exact matching first, then fuzzy matching as fallback.
     Detects hallucinations when the model suggests non-existent links.
+    Returns: (chosen_link, metadata) where metadata includes the reason.
     """
     if not response:
         return None, None
     
     # Initialize metadata for tracking match quality
-    metadata = {"fallback_used": False, "match_type": None, "similarity_score": 0.0}
+    metadata = {"fallback_used": False, "match_type": None, "similarity_score": 0.0, "reason": ""}
     
-    # Clean the response from common punctuation and formatting
-    chosen = response.strip().strip('"\'.,:;!?()[]{}')
+    # Try to parse JSON response
+    chosen = None
+    reason = ""
+    
+    try:
+        # Attempt to parse JSON response
+        response_data = json.loads(response.strip())
+        chosen = response_data.get("link", "").strip()
+        reason = response_data.get("reason", "").strip()
+    except json.JSONDecodeError:
+        # Fallback: treat entire response as link name (backward compatibility)
+        print(f"JSON parsing failed, treating response as plain text link")
+        chosen = response.strip().strip('"\'.,:;!?()[]{}')
+        reason = "No reason provided (non-JSON response)"
+    
+    # Store the reason in metadata
+    metadata["reason"] = reason
     
     if not chosen:
         return None, None
@@ -328,6 +366,7 @@ def run_navigation_experiment(start_article, target_article, temperature=0.3):
             "step_number": step,
             "origin_page": current,
             "destination_page": chosen,
+            "reason": metadata.get("reason", ""),
             "available_links_count": len(available),
             "total_visited": len(visited),
             "fallback_used": metadata.get("fallback_used", False),
@@ -366,6 +405,15 @@ def run_navigation_experiment(start_article, target_article, temperature=0.3):
     }
 
 # ===== MAIN EXECUTION =====
+# Automatically detect the model name from LM Studio if not specified in config
+if 'model_name' not in CONFIG or CONFIG['model_name'] == 'lm_studio':
+    detected_model = get_lm_studio_model_name()
+    CONFIG['model_name'] = detected_model
+    # Update output directory with detected model name
+    CONFIG['output_dir'] = detected_model.replace('/', '_').replace(':', '_').replace('\\', '_')
+    print(f"Using model: {CONFIG['model_name']}")
+    print(f"Output directory: {CONFIG['output_dir']}")
+
 all_results = []
 total_iterations = len(start_pages) * len(temperatures) * iterations
 

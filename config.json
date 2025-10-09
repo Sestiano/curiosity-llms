@@ -1,13 +1,10 @@
 {
   "start_pages": [
-    "Vaccine",
-    "Philosophy",
     "Albert Einstein",
-    "Ancient Rome",
     "Computer Science"
   ],
   "target": "Stockholm",
-  "iterations_per_start_page": 100,
+  "iterations_per_start_page": 20,
   "temperatures": [0.3, 1.5],
   "lm_studio_url": "http://localhost:1234/v1/chat/completions",
   "model_name": "lm_studio",
@@ -22,8 +19,6 @@
     "Help:",
     "Wikipedia:",
     "Talk:",
-    "Special:",
-    "List of",
-    "Timeline of"
+    "Special"
   ]
 }
