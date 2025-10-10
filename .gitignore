@@ -1,5 +1,5 @@
 # Result directories
-openai_gpt-oss-20b-1/
+results/
 *_run*/
 
 # Data files
