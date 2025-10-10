@@ -6,6 +6,7 @@
   "target": "Stockholm",
   "iterations_per_start_page": 20,
   "temperatures": [0.3, 1.5],
+  "personalities": ["baseline", "busybody", "hunter", "dancer"],
   "lm_studio_url": "http://localhost:1234/v1/chat/completions",
   "model_name": "lm_studio",
   "output_dir": "results",

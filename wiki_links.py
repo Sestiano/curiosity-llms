@@ -77,9 +77,10 @@ def get_wikipedia_links(title, max_retries=3):
     return []
 
 def main():
-    data_dir = Path("C:\Users\sebas\Desktop\seb\Wikispeedai\Wikispeedai\lm_studio\temp_0_3\Vaccine")
-    output_file = Path("C:\Users\sebas\Desktop\seb\Wikispeedai\Wikispeedai\lm_studio\temp_0_3")
-    backup_file = Path("C:\Users\sebas\Desktop\seb\Wikispeedai\Wikispeedai\lm_studio\temp_0_3")
+    # Use current directory and search recursively
+    data_dir = Path(".")
+    output_file = Path("wikipedia_links.pkl")
+    backup_file = Path("wikipedia_links_backup.pkl")
     
     # Backup old file if exists
     if output_file.exists():
@@ -87,9 +88,9 @@ def main():
         shutil.copy(output_file, backup_file)
         print(f"Backed up old file to: {backup_file}\n")
     
-    # Load all unique pages from results
+    # Load all unique pages from results (search recursively)
     all_pages = set()
-    json_files = sorted(data_dir.glob("result_*.json"))
+    json_files = sorted(data_dir.glob("**/result_*.json"))
     
     print(f"Loading pages from {len(json_files)} JSON files...")
     for json_file in json_files:
