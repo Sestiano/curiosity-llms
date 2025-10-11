@@ -1,9 +1,11 @@
 # Result directories
 results/
+results-old/
 *_run*/
 
 # Data files
 wikipedia_links.pkl
+wikipedia_links_backup.pkl
 
 # Python
 __pycache__/

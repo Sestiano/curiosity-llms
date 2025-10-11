@@ -11,6 +11,8 @@ import pickle
 import time
 from pathlib import Path
 import wikipedia
+from bs4 import BeautifulSoup
+from urllib.parse import unquote
 
 
 def get_wikipedia_page(title):
@@ -46,28 +48,56 @@ def get_wikipedia_page(title):
 
 
 def get_page_links(page, exclude_keywords=None):
-    """
-    Estrae i links dalla pagina Wikipedia.
-    Filtra i link non desiderati (categorie, template, ecc.).
-    Same logic as wikispeedia.ipynb.
-    """
+    """Extract links from a Wikipedia page in order of appearance."""
     if not page:
         return []
     
-    if exclude_keywords is None:
-        exclude_keywords = ['Category:', 'Template:', 'File:', 'Portal:', 
-                           'Help:', 'Wikipedia:', 'Talk:', 'Special:', 
-                           'List of', 'Timeline of']
+    # Define keywords for non-content pages to exclude
+    exclude = exclude_keywords or ['Category:', 'Template:', 'File:', 'Portal:', 
+                                   'Help:', 'Wikipedia:', 'Talk:', 'Special:']
+    
+    try:
+        from urllib.parse import unquote
+        # Parse HTML to extract links in their actual order
+        soup = BeautifulSoup(page.html(), 'html.parser')
+        content = soup.find('div', {'id': 'mw-content-text'})
         
-    links = page.links
+        # Fallback to default links if HTML parsing fails
+        if not content:
+            try:
+                return [l for l in page.links if not any(kw in l for kw in exclude)]
+            except (KeyError, AttributeError) as e:
+                print(f"Error accessing page.links: {e}")
+                return []
+        
+        seen = set()
+        links = []
+        
+        # Extract all wiki links from content
+        for a in content.find_all('a', href=True):
+            href = a.get('href', '')
+            if not href.startswith('/wiki/'):
+                continue
+            
+            # Decode URL and convert to readable title
+            title = unquote(href.replace('/wiki/', '').replace('_', ' '))
+            
+            # Skip excluded pages and duplicates
+            if any(kw in title for kw in exclude) or title in seen:
+                continue
+            
+            seen.add(title)
+            links.append(title)
+        
+        return links
     
-    # Filtra i link indesiderati
-    filtered_links = []
-    for link in links:
-        if not any(kw in link for kw in exclude_keywords):
-            filtered_links.append(link)
-    
-    return filtered_links
+    except Exception as e:
+        print(f"Error parsing HTML: {e}, using fallback")
+        try:
+            return [l for l in page.links if not any(kw in l for kw in exclude)]
+        except (KeyError, AttributeError) as fallback_error:
+            print(f"Fallback also failed: {fallback_error}. Returning empty list.")
+            return []
 
 def get_wikipedia_links(title, max_retries=3):
     """Get all hyperlinks from a Wikipedia page using wikipedia library."""
@@ -77,10 +107,15 @@ def get_wikipedia_links(title, max_retries=3):
     return []
 
 def main():
-    # Use current directory and search recursively
-    data_dir = Path(".")
+    # Use results directory and search recursively
+    data_dir = Path("results")
     output_file = Path("wikipedia_links.pkl")
     backup_file = Path("wikipedia_links_backup.pkl")
+    
+    # Check if results directory exists
+    if not data_dir.exists():
+        print(f"Error: Directory '{data_dir}' not found!")
+        return
     
     # Backup old file if exists
     if output_file.exists():
@@ -92,7 +127,9 @@ def main():
     all_pages = set()
     json_files = sorted(data_dir.glob("**/result_*.json"))
     
-    print(f"Loading pages from {len(json_files)} JSON files...")
+    print(f"Scanning results directory: {data_dir.absolute()}")
+    print(f"Loading pages from {len(json_files)} JSON files...\n")
+    
     for json_file in json_files:
         with open(json_file, 'r', encoding='utf-8') as f:
             result = json.load(f)

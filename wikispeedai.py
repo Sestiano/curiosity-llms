@@ -221,7 +221,11 @@ def get_page_links(page, exclude_keywords=None):
         
         # Fallback to default links if HTML parsing fails
         if not content:
-            return [l for l in page.links if not any(kw in l for kw in exclude)]
+            try:
+                return [l for l in page.links if not any(kw in l for kw in exclude)]
+            except (KeyError, AttributeError) as e:
+                print(f"Error accessing page.links: {e}")
+                return []
         
         seen = set()
         links = []
@@ -246,7 +250,11 @@ def get_page_links(page, exclude_keywords=None):
     
     except Exception as e:
         print(f"Error parsing HTML: {e}, using fallback")
-        return [l for l in page.links if not any(kw in l for kw in exclude)]
+        try:
+            return [l for l in page.links if not any(kw in l for kw in exclude)]
+        except (KeyError, AttributeError) as fallback_error:
+            print(f"Fallback also failed: {fallback_error}. Returning empty list.")
+            return []
 
 def fuzzy_similarity(s1, s2):
     """
