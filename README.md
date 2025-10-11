@@ -131,3 +131,7 @@ Use `analysis.ipynb` to analyze experimental results:
 - Compare fallback and hallucination rates
 - Generate visualizations of navigation patterns
 
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
