@@ -22,6 +22,7 @@ def load_config():
         'temperatures': [0.3, 1.5],
         'personalities': ['baseline', 'busybody', 'hunter', 'dancer'],
         'lm_studio_url': "http://localhost:1234/v1/chat/completions",
+      # "model_name": "qwen/qwen3-4b-thinking-2507", add this line in config.json with the exact model name if you're going to use version 1 
         'fuzzy_match_threshold': 0.95,
         'max_loop_repetitions': 3,
     }

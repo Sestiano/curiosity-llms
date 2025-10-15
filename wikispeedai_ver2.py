@@ -14,16 +14,37 @@ wikipedia.set_lang('en')
 warnings.filterwarnings('ignore')
 
 # ===== CONFIGURATION =====
+def get_lm_studio_model_name(lm_studio_url):
+    """Retrieve the current model name from LM Studio API."""
+    try:
+        models_url = lm_studio_url.replace('/v1/chat/completions', '/v1/models')
+        response = requests.get(models_url, timeout=20)
+        response.raise_for_status()
+        result = response.json()
+        if 'data' in result and len(result['data']) > 0:
+            # Get the first model (usually the loaded one)
+            model_name = result['data'][0].get('id', 'lm_studio')
+            print(f"Auto-detected LM Studio model: {model_name}")
+            return model_name
+        else:
+            print("No model found in LM Studio response, using default 'lm_studio'")
+            return 'lm_studio'
+    except Exception as e:
+        print(f"Could not retrieve model name from LM Studio: {e}")
+        print("Using default 'lm_studio' as model name")
+        return 'lm_studio'
+
 def load_config():
     """Load and validate configuration from config.json or use defaults"""
     # Default configuration values
     defaults = {
-        'start_pages': ['Vaccine', 'Philosophy'],
+        'start_pages': ['Vaccine', 'Albert Einstein'],
         'target': 'Renaissance',
-        'iterations_per_start_page': 10,
+        'iterations_per_start_page': 100,
         'temperatures': [0.3, 1.5],
         'personalities': ['baseline', 'busybody', 'hunter', 'dancer'],
         'lm_studio_url': "http://localhost:1234/v1/chat/completions",
+      # "model_name": "qwen/qwen3-4b-thinking-2507", add this line in config.json with the exact model name if you're going to use version 1 
         'fuzzy_match_threshold': 0.95,
         'max_loop_repetitions': 3,
         'max_correction_attempts': 2  # Max retries after an error like hallucination
@@ -37,8 +58,15 @@ def load_config():
     else:
         config = defaults
 
-    # Create output directory name from model name if provided
-    model_name = config.get('model_name', 'lm_studio')
+    # Auto-detect model name from LM Studio if not specified
+    if 'model_name' not in config or not config['model_name']:
+        print("Model name not specified in config, auto-detecting from LM Studio...")
+        config['model_name'] = get_lm_studio_model_name(config.get('lm_studio_url', defaults['lm_studio_url']))
+    else:
+        print(f"Using model name from config: {config['model_name']}")
+    
+    # Create output directory name from model name
+    model_name = config['model_name']
     config['output_dir'] = model_name.replace('/', '_').replace(':', '_').replace('\\', '_')
 
     # Normalize start_pages (sp) and temperature (t) to always be a list
@@ -193,27 +221,15 @@ def create_correction_prompt(invalid_choice, target_article, links, path):
     return prompt
 
 # ===== API & WIKIPEDIA FUNCTIONS =====
-def get_lm_studio_model_name():
-    """Retrieve the current model name from LM Studio API."""
-    try:
-        models_url = CONFIG['lm_studio_url'].replace('/v1/chat/completions', '/v1/models')
-        response = requests.get(models_url, timeout=10)
-        response.raise_for_status()
-        result = response.json()
-        if 'data' in result and len(result['data']) > 0:
-            model_name = result['data'][0].get('id', 'lm_studio')
-            print(f"Detected LM Studio model: {model_name}")
-            return model_name
-        else:
-            print("No model found in LM Studio response, using default")
-            return 'lm_studio'
-    except Exception as e:
-        print(f"Could not retrieve model name from LM Studio: {e}")
-        return 'lm_studio'
-
 def call_lm_studio(messages, temperature=0.3):
     """Call LM Studio API."""
-    payload = {"messages": messages, "temperature": temperature}
+    payload = {
+        "model": CONFIG.get('model_name', 'local-model'),
+        "messages": messages, 
+        "temperature": temperature,
+        "max_tokens": -1,  # -1 means use maximum available
+        "stream": False
+    }
     try:
         response = requests.post(CONFIG['lm_studio_url'], json=payload, timeout=1200)
         response.raise_for_status()
@@ -221,6 +237,9 @@ def call_lm_studio(messages, temperature=0.3):
         return result['choices'][0]['message']['content'].strip()
     except requests.exceptions.RequestException as e:
         print(f"Error calling LM Studio: {e}")
+        # Print response content if available for debugging
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Response content: {e.response.text}")
         return None
 
 def get_personality_prompt(personality_name="baseline"):
