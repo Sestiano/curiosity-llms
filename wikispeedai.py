@@ -340,9 +340,22 @@ Rules:
                 logging.error(f"Response content: {e.response.text}")
             return None
     
-    def get_personality_prompt(self, personality_name: str = "baseline") -> str:
-        """Get the combined system prompt."""
-        traits = self.PERSONALITY_TRAITS.get(personality_name, "")
+    def get_personality_prompt(self, personality: Personality | str = "baseline") -> str:
+        """Get the combined system prompt for a given personality."""
+        # Handle both Enum and string input
+        if isinstance(personality, Personality):
+            traits = personality.traits
+        elif isinstance(personality, str):
+            # String input - validate it
+            try:
+                personality_enum = Personality(personality)
+                traits = personality_enum.traits
+            except ValueError:
+                logging.warning(f"Invalid personality '{personality}', using baseline")
+                traits = ""
+        else:
+            traits = ""
+        
         return f"{self.BASELINE_PROMPT}\n{traits}" if traits else self.BASELINE_PROMPT
     
     def get_wikipedia_page(self, title: str) -> Tuple[str, any]:
