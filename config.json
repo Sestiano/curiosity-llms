@@ -4,21 +4,14 @@
     "Computer Science"
   ],
   "target": "Stockholm",
-  "iterations_per_start_page": 20,
-  "temperatures": [0.3, 1.5],
+  "iterations_per_start_page": 100,
+  "temperatures": [0.3, 0.7],
   "personalities": ["baseline", "busybody", "hunter", "dancer"],
   "lm_studio_url": "http://localhost:1234/v1/chat/completions",
-  "output_dir": "results",
+  "model_name": "",
   "fuzzy_match_threshold": 0.95,
   "max_loop_repetitions": 3,
-  "exclude_keywords": [
-    "Category:",
-    "Template:",
-    "File:",
-    "Portal:",
-    "Help:",
-    "Wikipedia:",
-    "Talk:",
-    "Special"
-  ]
+  "max_correction_attempts": 1,
+  "api_timeout": 1200,
+  "model_detection_timeout": 120
 }
