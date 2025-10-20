@@ -353,6 +353,7 @@ def parse_model_choice(response, available_links):
 def run_navigation_experiment(start_article, target_article, temperature=0.3, personality="baseline"):
     current, path, visited = start_article, [start_article], {start_article.lower()}
     success, detailed_steps, loop_detected = False, [], False
+    error_type = None  # Track why the experiment failed
     
     fallback_stats = {
         "total_fallbacks": 0, "fuzzy_match_fallbacks": 0, "total_hallucinations": 0,
@@ -396,17 +397,22 @@ def run_navigation_experiment(start_article, target_article, temperature=0.3, pe
                 else:
                     print("ERROR: LLM failed to resolve disambiguation. Halting.")
                     status = 'error'
+                    error_type = "disambiguation_resolution_failed"
                     break
             else: # 'not_found' or 'error'
+                error_type = f"page_load_failed_{status}"
                 break
         
         if not page or status != 'success':
+            if not error_type:
+                error_type = "page_load_unknown_error"
             break
 
         # --- 2. EXTRACT LINKS ---
         available = [l for l in get_page_links(page) if l.lower() not in visited]
         if not available:
             print("Dead end reached.")
+            error_type = "dead_end_no_links"
             break
         
         # --- 3. GET LLM CHOICE (with self-correction loop) ---
@@ -416,7 +422,9 @@ def run_navigation_experiment(start_article, target_article, temperature=0.3, pe
                 else create_correction_prompt(metadata.get("raw_choice"), target_article, available, path)
             
             response = call_lm_studio([{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}], temperature)
-            if not response: break
+            if not response:
+                error_type = "api_call_failed"
+                break
             
             chosen, metadata = parse_model_choice(response, available)
             metadata["correction_attempts"] = attempt
@@ -432,6 +440,8 @@ def run_navigation_experiment(start_article, target_article, temperature=0.3, pe
         
         if not chosen:
             print("LLM failed to provide a valid link after retries. Halting.")
+            if not error_type:
+                error_type = "hallucination_max_retries_exceeded"
             break
             
         # --- 5. LOOP DETECTION & STATE UPDATE ---
@@ -441,6 +451,7 @@ def run_navigation_experiment(start_article, target_article, temperature=0.3, pe
         
         if recent_transitions.count(transition) >= max_loop_repetitions:
             loop_detected = True
+            error_type = "loop_detected"
             print(f"LOOP DETECTED: Transition '{current}' -> '{chosen}' repeated.")
             break
             
@@ -476,7 +487,8 @@ def run_navigation_experiment(start_article, target_article, temperature=0.3, pe
         "detailed_steps": detailed_steps, "fallback_statistics": fallback_stats,
         "start": start_article, "target": target_article, "model": CONFIG.get('model_name', 'unknown'),
         "personality": personality, "lm_studio_url": CONFIG['lm_studio_url'],
-        "total_pages_visited": len(visited), "loop_detected": loop_detected
+        "total_pages_visited": len(visited), "loop_detected": loop_detected,
+        "error_type": error_type  # NEW: Track failure reason
     }
 
 # ===== MAIN EXECUTION =====
@@ -499,6 +511,9 @@ if __name__ == '__main__':
         for start_page in start_pages:
             for personality in personalities:
                 for i in tqdm(range(iterations), desc=f"{start_page} (T={temp}, P={personality})"):
+                    # Set random seed for reproducibility
+                    random.seed(f"{start_page}_{temp}_{personality}_{i}")
+                    
                     result = run_navigation_experiment(start_page, CONFIG['target'], temp, personality)
                     
                     result.update({
@@ -508,7 +523,7 @@ if __name__ == '__main__':
                     })
                     all_results.append(result)
 
-                    # Save individual result to file
+                    # Save individual result IMMEDIATELY after each iteration
                     temp_str = str(temp).replace('.', '_')
                     output_dir = os.path.join(CONFIG['output_dir'], 
                                               f"temp_{temp_str}_personality_{personality}", 
