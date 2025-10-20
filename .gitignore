@@ -1,7 +1,9 @@
 # Result directories
 results/
-results-old/
 *_run*/
+
+# Backup directory
+backup/
 
 # Data files
 wikipedia_links.pkl

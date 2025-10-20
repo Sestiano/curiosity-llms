@@ -7,32 +7,66 @@ from tqdm import tqdm
 import os
 from bs4 import BeautifulSoup
 from difflib import SequenceMatcher
+import random
 
+# --- Setup ---
 wikipedia.set_lang('en')
 warnings.filterwarnings('ignore')
 
 # ===== CONFIGURATION =====
+def get_lm_studio_model_name(lm_studio_url):
+    """Retrieve the current model name from LM Studio API."""
+    try:
+        models_url = lm_studio_url.replace('/v1/chat/completions', '/v1/models')
+        response = requests.get(models_url, timeout=20)
+        response.raise_for_status()
+        result = response.json()
+        if 'data' in result and len(result['data']) > 0:
+            # Get the first model (usually the loaded one)
+            model_name = result['data'][0].get('id', 'lm_studio')
+            print(f"Auto-detected LM Studio model: {model_name}")
+            return model_name
+        else:
+            print("No model found in LM Studio response, using default 'lm_studio'")
+            return 'lm_studio'
+    except Exception as e:
+        print(f"Could not retrieve model name from LM Studio: {e}")
+        print("Using default 'lm_studio' as model name")
+        return 'lm_studio'
+
 def load_config():
     """Load and validate configuration from config.json or use defaults"""
     # Default configuration values
     defaults = {
-        'start_pages': ['Vaccine', 'Philosophy'],
+        'start_pages': ['Vaccine', 'Albert Einstein'],
         'target': 'Renaissance',
-        'iterations_per_start_page': 10,
+        'iterations_per_start_page': 100,
         'temperatures': [0.3, 1.5],
         'personalities': ['baseline', 'busybody', 'hunter', 'dancer'],
         'lm_studio_url': "http://localhost:1234/v1/chat/completions",
       # "model_name": "qwen/qwen3-4b-thinking-2507", add this line in config.json with the exact model name if you're going to use version 1 
         'fuzzy_match_threshold': 0.95,
         'max_loop_repetitions': 3,
+        'max_correction_attempts': 2  # Max retries after an error like hallucination
     }
     
-    # Load configuration from file if exists, otherwise use defaults
+    # Load configuration from file if it exists, otherwise use defaults
     config_file = 'config.json'
-    config = json.load(open(config_file, 'r', encoding='utf-8')) if os.path.exists(config_file) else defaults
+    if os.path.exists(config_file):
+        with open(config_file, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+    else:
+        config = defaults
 
+    # Auto-detect model name from LM Studio if not specified
+    if 'model_name' not in config or not config['model_name']:
+        print("Model name not specified in config, auto-detecting from LM Studio...")
+        config['model_name'] = get_lm_studio_model_name(config.get('lm_studio_url', defaults['lm_studio_url']))
+    else:
+        print(f"Using model name from config: {config['model_name']}")
+    
     # Create output directory name from model name
-    model_name = config.get('model_name', 'lm_studio')
+    model_name = config['model_name']
     config['output_dir'] = model_name.replace('/', '_').replace(':', '_').replace('\\', '_')
 
     # Normalize start_pages (sp) and temperature (t) to always be a list
@@ -43,11 +77,7 @@ def load_config():
     
     return config
 
-# Load global configuration
 CONFIG = load_config()
-start_pages = CONFIG['start_pages']
-temperatures = CONFIG['temperatures']
-iterations = CONFIG['iterations_per_start_page']
 
 # Define the baseline prompt that is always used
 BASELINE_PROMPT = """
@@ -58,7 +88,7 @@ Rules:
 - Read the CURRENT PAGE CONTENT to understand the topic and available connections
 - Choose ONE link that brings you towards the target's webpage
 - You MUST reply in JSON format with TWO fields:
-  * "link": the exact link name from the available options
+  * "link": the EXACT LINK name from the available options
   * "reason": a BRIEF explanation of why you chose this link
 """
 
@@ -118,331 +148,317 @@ def create_navigation_prompt(current_article, target_article, links, path, page_
 
     return prompt
 
-def get_lm_studio_model_name():
+def create_disambiguation_prompt(original_choice, options, target_article, path):
     """
-    Retrieve the current model name from LM Studio API.
-    Returns the model name or 'lm_studio' as fallback.
+    Create a prompt for the LLM to resolve a disambiguation page.
+    
+    When Wikipedia returns multiple options for an ambiguous article name,
+    this function creates a prompt asking the LLM to select the most relevant option.
+    The options are shuffled to prevent position bias in the model's selection.
+    
+    Args:
+        original_choice: The ambiguous article name that led to disambiguation
+        options: List of possible disambiguation options from Wikipedia
+        target_article: The final target article we're trying to reach
+        path: List of articles visited so far in the navigation
+    
+    Returns:
+        A formatted prompt string for the LLM
     """
-    try:
-        # LM Studio's /v1/models endpoint returns info about loaded models
-        models_url = CONFIG['lm_studio_url'].replace('/v1/chat/completions', '/v1/models')
-        response = requests.get(models_url, timeout=10)
-        response.raise_for_status()
-        result = response.json()
-        
-        # Get the first available model
-        if 'data' in result and len(result['data']) > 0:
-            model_name = result['data'][0].get('id', 'lm_studio')
-            print(f"Detected LM Studio model: {model_name}")
-            return model_name
-        else:
-            print("No model found in LM Studio response, using default")
-            return 'lm_studio'
-    except Exception as e:
-        print(f"Could not retrieve model name from LM Studio: {e}")
-        return 'lm_studio'
+    # Show recent navigation path for context
+    recent_path = ' '.join(path[:-1]) if len(path) > 1 else {start_page}
 
+    # Shuffle the options to avoid position bias (e.g., model preferring first option)
+    shuffled_options = options.copy()
+    random.shuffle(shuffled_options)
+    options_list = '\n'.join(shuffled_options)
+
+    prompt = f"""Your previous choice "{original_choice}" was AMBIGUOS.
+                 Your PREVIOUS PAGE was: {recent_path}
+
+                 To continue, you must choose ONE link that brings you towards the target's webpage: "{target_article}".
+                 AVAILABLE OPTIONS:
+                 {options_list}
+                 
+                 TASK: Choose the BEST option from the list to reach the target. Respond in JSON format with both "link" and "reason" fields.
+                """
+    return prompt
+
+def create_correction_prompt(invalid_choice, target_article, links, path):
+    """
+    Create a prompt for the LLM to correct an invalid link selection.
+    
+    When the LLM hallucinates or selects a link that doesn't exist in the available options,
+    this function creates a correction prompt to guide the model to choose a valid link.
+    The links are shuffled to prevent position bias in the corrected selection.
+    
+    Args:
+        invalid_choice: The invalid link name that was hallucinated or incorrectly selected
+        target_article: The final target article we're trying to reach
+        links: List of actually available links on the current page
+        path: List of articles visited so far in the navigation
+    
+    Returns:
+        A formatted correction prompt string for the LLM
+    """
+    # Show recent navigation path for context
+    recent_path = ' '.join(path[:-1]) if len(path) > 1 else {start_page}
+
+    # Shuffle the links to avoid position bias (e.g., model always picking first link after error)
+    shuffled_links = links.copy()
+    random.shuffle(shuffled_links)
+    links_list = '\n'.join(shuffled_links)
+
+    prompt = f"""CORRECTION REQUIRED: Your previous choice "{invalid_choice}" was INVALID because it is NOT in the list of available links.
+
+                 Your TARGET is : "{target_article}"
+                 Your PREVIOUS PAGE was: {recent_path}
+                 
+                 Please review the AVAILABLE LINKS carefully. You must choose one of these available links: {links_list}
+                 
+                 TASK: Choose a VALID link from the list. Respond in JSON.
+                """
+    return prompt
+
+# ===== API & WIKIPEDIA FUNCTIONS =====
 def call_lm_studio(messages, temperature=0.3):
-    """Call LM Studio API with the given messages and temperature setting"""
-    
-    # Prepare the API request payload
+    """Call LM Studio API."""
     payload = {
-        "messages": messages,
+        "model": CONFIG.get('model_name', 'local-model'),
+        "messages": messages, 
         "temperature": temperature,
+        "max_tokens": -1,  # -1 means use maximum available
+        "stream": False
     }
-    
     try:
-        # Send request to LM Studio with generous timeout for slow models
         response = requests.post(CONFIG['lm_studio_url'], json=payload, timeout=1200)
         response.raise_for_status()
         result = response.json()
         return result['choices'][0]['message']['content'].strip()
     except requests.exceptions.RequestException as e:
         print(f"Error calling LM Studio: {e}")
+        # Print response content if available for debugging
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Response content: {e.response.text}")
         return None
 
 def get_personality_prompt(personality_name="baseline"):
-    """
-    Get the system prompt by combining the baseline with personality traits.
-    The baseline instructions are always included, and personality traits are added on top.
-    Valid personality names: 'baseline', 'busybody', 'hunter', 'dancer'
-    """
-    traits = PERSONALITY_TRAITS.get(personality_name, PERSONALITY_TRAITS["baseline"])
-    
-    # Combine baseline + personality traits
-    if traits:
-        return BASELINE_PROMPT + "\n" + traits
-    else:
-        return BASELINE_PROMPT
+    """Get the combined system prompt."""
+    traits = PERSONALITY_TRAITS.get(personality_name, "")
+    return f"{BASELINE_PROMPT}\n{traits}" if traits else BASELINE_PROMPT
 
 def get_wikipedia_page(title):
     """
-    Load a Wikipedia page by title.
-    Handles disambiguation errors, redirects, and missing pages.
+    Loads a Wikipedia page with scientifically sound error handling.
+    It reports ambiguities instead of resolving them.
+
+    Returns: tuple (status, result)
+    - ('success', page_object)
+    - ('disambiguation', options_list)
+    - ('not_found', None)
+    - ('error', error_message)
     """
     try:
-        # Try to get the page without suggestions
-        page = wikipedia.page(title, auto_suggest=False)
-        return page
-    except wikipedia.exceptions.PageError:
-        # If not found, try with auto-suggestions enabled
-        try:
-            print(f'Page "{title}" not found, trying with suggestions...')
-            page = wikipedia.page(title, auto_suggest=True)
-            print(f'Found alternative: {page.title}')
-            return page
-        except Exception as e:
-            print(f'Still not found: {title}')
-            return None
+        page = wikipedia.page(title, auto_suggest=False, redirect=True)
+        return 'success', page
     except wikipedia.exceptions.DisambiguationError as e:
-        # Handle disambiguation pages by selecting the first option
-        print(f'Disambiguation for {title}, using {e.options[0]}')
+        print(f"INFO: '{title}' is a disambiguation page. Returning options.")
+        return 'disambiguation', e.options
+    except wikipedia.exceptions.PageError:
+        print(f"INFO: Page '{title}' not found. Trying with auto-suggest...")
         try:
-            return wikipedia.page(e.options[0])
-        except Exception:
-            return None
+            page = wikipedia.page(title, auto_suggest=True, redirect=True)
+            print(f"INFO: Found alternative page: '{page.title}'")
+            return 'success', page
+        except wikipedia.exceptions.DisambiguationError as e:
+            print(f"INFO: Suggestion for '{title}' also led to a disambiguation.")
+            return 'disambiguation', e.options
+        except wikipedia.exceptions.PageError:
+            print(f"ERROR: No page found for '{title}', even with suggestions.")
+            return 'not_found', None
+        except Exception as e:
+            print(f"ERROR: Unexpected error during auto-suggest for '{title}': {e}")
+            return 'error', str(e)
     except Exception as e:
-        print(f'Error loading page {title}: {e}')
-        return None
-    
+        print(f"ERROR: Unexpected error while loading '{title}': {e}")
+        return 'error', str(e)
+
 def get_page_links(page, exclude_keywords=None):
     """Extract links from a Wikipedia page in order of appearance."""
-    if not page:
-        return []
-    
-    # Define keywords for non-content pages to exclude
-    exclude = exclude_keywords or ['Category:', 'Template:', 'File:', 'Portal:', 
-                                   'Help:', 'Wikipedia:', 'Talk:', 'Special:']
-    
+    if not page: return []
+    exclude = exclude_keywords or ['Category:', 'Template:', 'File:', 'Portal:', 'Help:', 'Wikipedia:', 'Talk:', 'Special:']
     try:
         from urllib.parse import unquote
-        # Parse HTML to extract links in their actual order
         soup = BeautifulSoup(page.html(), 'html.parser')
         content = soup.find('div', {'id': 'mw-content-text'})
-        
-        # Fallback to default links if HTML parsing fails
         if not content:
-            try:
-                return [l for l in page.links if not any(kw in l for kw in exclude)]
-            except (KeyError, AttributeError) as e:
-                print(f"Error accessing page.links: {e}")
-                return []
+            return [l for l in page.links if not any(kw in l for kw in exclude)]
         
-        seen = set()
-        links = []
-        
-        # Extract all wiki links from content
+        seen, links = set(), []
         for a in content.find_all('a', href=True):
             href = a.get('href', '')
-            if not href.startswith('/wiki/'):
-                continue
-            
-            # Decode URL and convert to readable title
-            title = unquote(href.replace('/wiki/', '').replace('_', ' '))
-            
-            # Skip excluded pages and duplicates
-            if any(kw in title for kw in exclude) or title in seen:
-                continue
-            
-            seen.add(title)
-            links.append(title)
-        
+            if href.startswith('/wiki/'):
+                title = unquote(href.replace('/wiki/', '').replace('_', ' '))
+                if not any(kw in title for kw in exclude) and title not in seen:
+                    seen.add(title)
+                    links.append(title)
         return links
-    
     except Exception as e:
-        print(f"Error parsing HTML: {e}, using fallback")
+        print(f"Error parsing HTML: {e}, using fallback.")
         try:
             return [l for l in page.links if not any(kw in l for kw in exclude)]
-        except (KeyError, AttributeError) as fallback_error:
-            print(f"Fallback also failed: {fallback_error}. Returning empty list.")
+        except:
             return []
 
 def fuzzy_similarity(s1, s2):
-    """
-    Calculate fuzzy similarity between two strings using SequenceMatcher.
-    Returns a value between 0 and 1, where 1 is an exact match.
-    """
+    """Calculate fuzzy similarity between two strings."""
     return SequenceMatcher(None, s1.lower(), s2.lower()).ratio()
 
-def parse_model_choice(response, available_links, target_article=None):
-    """
-    Parse the model's response and match it to an available link.
-    Expects JSON format with 'link' and 'reason' fields.
-    Uses exact matching first, then fuzzy matching as fallback.
-    Detects hallucinations when the model suggests non-existent links.
-    Returns: (chosen_link, metadata) where metadata includes the reason.
-    """
-    if not response:
-        return None, None
+def parse_model_choice(response, available_links):
+    """Parse the model's response and match it to an available link."""
+    if not response: return None, {}
     
-    # Initialize metadata for tracking match quality
-    metadata = {"fallback_used": False, "match_type": None, "similarity_score": 0.0, "reason": ""}
-    
-    # Try to parse JSON response
-    chosen = None
-    reason = ""
+    metadata = {"fallback_used": False, "match_type": "unknown", "similarity_score": 0.0, "reason": "", "raw_choice": ""}
     
     try:
-        # Attempt to parse JSON response
         response_data = json.loads(response.strip())
-        chosen = response_data.get("link", "").strip()
-        reason = response_data.get("reason", "").strip()
+        chosen_text = response_data.get("link", "").strip()
+        metadata["reason"] = response_data.get("reason", "").strip()
     except json.JSONDecodeError:
-        # Fallback: treat entire response as link name (backward compatibility)
-        print(f"JSON parsing failed, treating response as plain text link")
-        chosen = response.strip().strip('"\'.,:;!?()[]{}')
-        reason = "No reason provided (non-JSON response)"
+        print(f"JSON parsing failed, treating response as plain text link.")
+        chosen_text = response.strip().strip('"\'.,:;!?()[]{}')
+        metadata["reason"] = "No reason provided (non-JSON response)"
     
-    # Store the reason in metadata
-    metadata["reason"] = reason
-    
-    if not chosen:
-        return None, None
+    metadata["raw_choice"] = chosen_text
+    if not chosen_text: return None, metadata
 
-    # Try exact match first (case-insensitive)
     for link in available_links:
-        if link.lower() == chosen.lower():
+        if link.lower() == chosen_text.lower():
             metadata.update({"match_type": "exact_match", "similarity_score": 1.0})
             return link, metadata
 
-    # If no exact match, try fuzzy matching
-    threshold = CONFIG.get('fuzzy_match_threshold', 0.75)
-    best_link, best_score = None, 0.0
+    threshold = CONFIG.get('fuzzy_match_threshold', 0.95)
+    best_link, best_score = max(((link, fuzzy_similarity(chosen_text, link)) for link in available_links), key=lambda item: item[1], default=(None, 0.0))
     
-    for link in available_links:
-        score = fuzzy_similarity(chosen, link)
-        if score > best_score:
-            best_score, best_link = score, link
-    
-    # Accept fuzzy match if above threshold
     if best_score >= threshold:
         metadata.update({"fallback_used": True, "match_type": "fuzzy_match", "similarity_score": best_score})
-        print(f"FALLBACK: Fuzzy match ({best_score:.2f}) - '{chosen}' -> '{best_link}'")
+        print(f"FALLBACK: Fuzzy match ({best_score:.2f}) - '{chosen_text}' -> '{best_link}'")
         return best_link, metadata
 
-    # No match found - model hallucinated a link
     metadata.update({"fallback_used": True, "match_type": "no_match_hallucination", "similarity_score": best_score})
-    print(f"HALLUCINATION: No match for '{chosen}' (best: {best_score:.2f})")
+    print(f"HALLUCINATION: No match for '{chosen_text}' (best: {best_score:.2f})")
     return None, metadata
 
+# ===== EXPERIMENT RUNNER =====
 def run_navigation_experiment(start_article, target_article, temperature=0.3, personality="baseline"):
-    """
-    Run a single Wikipedia navigation experiment from start to target article.
-    The LLM navigates by selecting links at each step until reaching the target or getting stuck.
-    Args:
-        start_article: Starting Wikipedia page
-        target_article: Target Wikipedia page to reach
-        temperature: LLM temperature setting (0.0-2.0)
-        personality: LLM personality type
-    """
-    
-    # Initialize navigation state
     current, path, visited = start_article, [start_article], {start_article.lower()}
-    success, detailed_steps = False, []
+    success, detailed_steps, loop_detected = False, [], False
     
-    # Initialize statistics for tracking fallback and hallucination behavior
     fallback_stats = {
         "total_fallbacks": 0, "fuzzy_match_fallbacks": 0, "total_hallucinations": 0,
-        "fallback_rate": 0.0, "avg_similarity_score": 0.0, "fallback_success_rate": 0.0,
-        "steps_with_fallback": [], "successful_fallback_steps": []
+        "fallback_rate": 0.0, "avg_similarity_score": 0.0,
+        "steps_with_fallback": [], "successful_fallback_steps": [], "fallback_success_rate": 0.0
     }
     
-    # Loop detection to prevent getting stuck in cycles
     max_loop_repetitions = CONFIG.get('max_loop_repetitions', 3)
+    max_correction_attempts = CONFIG.get('max_correction_attempts', 2)
     recent_transitions = []
-    loop_detected = False
-    
-    # Get the system prompt for the selected personality
     system_prompt = get_personality_prompt(personality)
     
     step = 0
-    # Main navigation loop
-    while True:
-        
-        # Check if we've reached the target
+    while step < 50:  # Max steps to prevent infinite runs
         if current.lower() == target_article.lower():
             success = True
             break
         
-        # Load the current Wikipedia page
-        page = get_wikipedia_page(current)
-        if not page:
-            break
+        # --- 1. LOAD PAGE (with disambiguation handling loop) ---
+        page, status = None, ''
+        temp_current = current
         
-        # Update current title (may differ due to redirects)
-        current = page.title
-        # Get available links, excluding already visited pages
+        for _ in range(max_correction_attempts):
+            status, result = get_wikipedia_page(temp_current)
+            
+            if status == 'success':
+                page = result
+                current = page.title  # Update to actual title after redirects
+                break
+            
+            elif status == 'disambiguation':
+                print("Disambiguation found. Asking LLM to choose.")
+                options = result
+                prompt = create_disambiguation_prompt(temp_current, options, target_article, path)
+                response = call_lm_studio([{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}], temperature)
+                
+                chosen_option, _ = parse_model_choice(response, options)
+                
+                if chosen_option:
+                    temp_current = chosen_option
+                else:
+                    print("ERROR: LLM failed to resolve disambiguation. Halting.")
+                    status = 'error'
+                    break
+            else: # 'not_found' or 'error'
+                break
+        
+        if not page or status != 'success':
+            break
+
+        # --- 2. EXTRACT LINKS ---
         available = [l for l in get_page_links(page) if l.lower() not in visited]
-        
-        # Dead end - no more links to explore
         if not available:
+            print("Dead end reached.")
             break
         
-        # Create prompt with current context and ask LLM to choose next link
-        prompt = create_navigation_prompt(current, target_article, available, path, page.content)
-        response = call_lm_studio([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
-        ], temperature=temperature)
+        # --- 3. GET LLM CHOICE (with self-correction loop) ---
+        chosen, metadata = None, {}
+        for attempt in range(max_correction_attempts):
+            prompt = create_navigation_prompt(current, target_article, available, path, page.content) if attempt == 0 \
+                else create_correction_prompt(metadata.get("raw_choice"), target_article, available, path)
+            
+            response = call_lm_studio([{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}], temperature)
+            if not response: break
+            
+            chosen, metadata = parse_model_choice(response, available)
+            metadata["correction_attempts"] = attempt
+            
+            if chosen: break
         
-        # LLM call failed
-        if not response:
-            break
-        
-        # Parse the LLM's choice and match it to an actual link
-        chosen, metadata = parse_model_choice(response, available, target_article)
-        
-        # Track fallback statistics for analysis
-        if metadata and metadata.get("fallback_used"):
+        # --- 4. PROCESS RESULT ---
+        if metadata.get("fallback_used"):
             fallback_stats["total_fallbacks"] += 1
             fallback_stats["steps_with_fallback"].append(step)
-            
-            if metadata.get("match_type") == "fuzzy_match":
-                fallback_stats["fuzzy_match_fallbacks"] += 1
-            elif metadata.get("match_type") == "no_match_hallucination":
-                fallback_stats["total_hallucinations"] += 1
+            if metadata["match_type"] == "fuzzy_match": fallback_stats["fuzzy_match_fallbacks"] += 1
+            elif metadata["match_type"] == "no_match_hallucination": fallback_stats["total_hallucinations"] += 1
         
-        # Model hallucinated or failed to choose - end navigation
         if not chosen:
+            print("LLM failed to provide a valid link after retries. Halting.")
             break
-        
-        # Loop detection: track recent page transitions
+            
+        # --- 5. LOOP DETECTION & STATE UPDATE ---
         transition = (current.lower(), chosen.lower())
         recent_transitions.append(transition)
-
-        # Keep only recent transitions for loop detection
-        if len(recent_transitions) > max_loop_repetitions * 2:
-            recent_transitions.pop(0)
-
-        # Count how many times this transition occurred
-        transition_count = recent_transitions.count(transition)
+        if len(recent_transitions) > max_loop_repetitions * 2: recent_transitions.pop(0)
         
-        # If same transition repeated too many times, stop (stuck in a loop)
-        if transition_count >= max_loop_repetitions:
+        if recent_transitions.count(transition) >= max_loop_repetitions:
             loop_detected = True
-            print(f"LOOP DETECTED: Transition '{current}' -> '{chosen}' repeated {transition_count} times")
+            print(f"LOOP DETECTED: Transition '{current}' -> '{chosen}' repeated.")
             break
-        
-        # Record detailed information about this step for analysis
+            
         detailed_steps.append({
-            "step_number": step,
-            "origin_page": current,
-            "destination_page": chosen,
-            "reason": metadata.get("reason", ""),
-            "available_links_count": len(available),
-            "total_visited": len(visited),
-            "fallback_used": metadata.get("fallback_used", False),
-            "match_type": metadata.get("match_type", "unknown"),
-            "similarity_score": metadata.get("similarity_score", 0.0)
+            "step_number": step, "origin_page": current, "destination_page": chosen,
+            "reason": metadata.get("reason", ""), "available_links_count": len(available),
+            "total_visited": len(visited), "fallback_used": metadata.get("fallback_used", False),
+            "match_type": metadata.get("match_type", "unknown"), "similarity_score": metadata.get("similarity_score", 0.0),
+            "correction_attempts": metadata.get("correction_attempts", 0)
         })
         
-        # Move to the chosen page
         current = chosen
         path.append(current)
         visited.add(current.lower())
         step += 1
-    
-    total_steps = len(path) - 1
+
+    # --- 6. FINAL STATISTICS CALCULATION ---
+    total_steps = len(detailed_steps)
     if total_steps > 0:
         fallback_stats["fallback_rate"] = (fallback_stats["total_fallbacks"] / total_steps) * 100
         
@@ -450,82 +466,57 @@ def run_navigation_experiment(start_article, target_article, temperature=0.3, pe
         if sim_scores:
             fallback_stats["avg_similarity_score"] = sum(sim_scores) / len(sim_scores)
         
-        if success and fallback_stats["total_fallbacks"] > 0:
-            fallback_stats["successful_fallback_steps"] = fallback_stats["steps_with_fallback"][:]
-            fallback_stats["fallback_success_rate"] = (
-                len(fallback_stats["successful_fallback_steps"]) / fallback_stats["total_fallbacks"] * 100
-            )
-    
+        if success:
+            fallback_stats["successful_fallback_steps"] = [s["step_number"] for s in detailed_steps if s["fallback_used"]]
+            if fallback_stats["total_fallbacks"] > 0:
+                fallback_stats["fallback_success_rate"] = (len(fallback_stats["successful_fallback_steps"]) / fallback_stats["total_fallbacks"]) * 100
+
     return {
         "success": success, "steps": len(path) - 1, "path": path,
         "detailed_steps": detailed_steps, "fallback_statistics": fallback_stats,
-        "start": start_article, "target": target_article,
-        "model": CONFIG.get('model_name', 'unknown'),
-        "personality": personality,
-        "lm_studio_url": CONFIG['lm_studio_url'],
-        "total_pages_visited": len(visited),
-        "loop_detected": loop_detected
+        "start": start_article, "target": target_article, "model": CONFIG.get('model_name', 'unknown'),
+        "personality": personality, "lm_studio_url": CONFIG['lm_studio_url'],
+        "total_pages_visited": len(visited), "loop_detected": loop_detected
     }
 
 # ===== MAIN EXECUTION =====
-# Automatically detect the model name from LM Studio if not specified in config
-if 'model_name' not in CONFIG or CONFIG['model_name'] == 'lm_studio':
-    detected_model = get_lm_studio_model_name()
-    CONFIG['model_name'] = detected_model
-    # Update output directory with detected model name
-    CONFIG['output_dir'] = detected_model.replace('/', '_').replace(':', '_').replace('\\', '_')
+if __name__ == '__main__':
+    if 'model_name' not in CONFIG or CONFIG['model_name'] == 'lm_studio':
+        detected_model = get_lm_studio_model_name()
+        CONFIG['model_name'] = detected_model
+        CONFIG['output_dir'] = detected_model.replace('/', '_').replace(':', '_').replace('\\', '_')
+    
     print(f"Using model: {CONFIG['model_name']}")
     print(f"Output directory: {CONFIG['output_dir']}")
 
-all_results = []
-
-# Get list of personalities to test
-personalities = CONFIG.get('personalities', ['baseline', 'busybody', 'hunter', 'dancer'])
-total_iterations = len(start_pages) * len(temperatures) * len(personalities) * iterations
-
-iteration_counter = 0
-
-# Run experiments for each temperature setting
-for temperature in temperatures:
+    all_results = []
+    personalities = CONFIG.get('personalities', ['baseline'])
+    start_pages = CONFIG['start_pages']
+    temperatures = CONFIG['temperatures']
+    iterations = CONFIG['iterations_per_start_page']
     
-    # Run experiments for each starting page
-    for start_page in start_pages:
-        
-        # Run experiments for each personality
-        for personality in personalities:
-            
-            # Run multiple iterations to gather statistics
-            for i in tqdm(range(iterations), desc=f"{start_page} (T={temperature}, P={personality})", unit="iter"):
-                iteration_counter += 1
-                
-                # Execute single navigation experiment
-                result = run_navigation_experiment(start_page, CONFIG['target'], 
-                                                  temperature=temperature, 
-                                                  personality=personality)
-                result.update({
-                    'config_start_page': start_page, 
-                    'temperature': temperature, 
-                    'personality': personality,
-                    'iteration_in_group': i + 1
-                })
-                all_results.append(result)
+    for temp in temperatures:
+        for start_page in start_pages:
+            for personality in personalities:
+                for i in tqdm(range(iterations), desc=f"{start_page} (T={temp}, P={personality})"):
+                    result = run_navigation_experiment(start_page, CONFIG['target'], temp, personality)
+                    
+                    result.update({
+                        'config_start_page': start_page, 
+                        'temperature': temp, 
+                        'iteration_in_group': i + 1
+                    })
+                    all_results.append(result)
 
-                # Save individual result to file
-                temp_str = str(temperature).replace('.', '_')
-                output_dir = os.path.join(CONFIG['output_dir'], 
-                                         f"temp_{temp_str}_personality_{personality}", 
-                                         start_page.replace(' ', '_'))
-                os.makedirs(output_dir, exist_ok=True)
-                
-                filename = os.path.join(output_dir, f"result_{i+1:03d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-                with open(filename, 'w', encoding='utf-8') as f:
-                    json.dump(result, f, indent=2, ensure_ascii=False)
+                    # Save individual result to file
+                    temp_str = str(temp).replace('.', '_')
+                    output_dir = os.path.join(CONFIG['output_dir'], 
+                                              f"temp_{temp_str}_personality_{personality}", 
+                                              start_page.replace(' ', '_'))
+                    os.makedirs(output_dir, exist_ok=True)
+                    
+                    filename = os.path.join(output_dir, f"result_{i+1:03d}.json")
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        json.dump(result, f, indent=2, ensure_ascii=False)
 
-# ===== SAVE ALL RESULTS =====
-# Save comprehensive summary of all experiments
-summary_file = os.path.join(CONFIG['output_dir'], f"all_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-os.makedirs(CONFIG['output_dir'], exist_ok=True)
-with open(summary_file, 'w', encoding='utf-8') as f:
-    json.dump(all_results, f, indent=2, ensure_ascii=False)
-
-print(f"\nCompleted {len(all_results)} iterations. Results saved to: {summary_file}")
+    print(f"\nCompleted {len(all_results)} iterations. Individual results saved in: {CONFIG['output_dir']}")
