@@ -3,7 +3,7 @@ Download Wikipedia hyperlink structure for analysis.
 
 This script downloads all hyperlinks from Wikipedia pages found in the AI navigation results,
 ensuring compatibility with the notebook navigation approach.
-Uses wikipedia library page.links property - same logic as wikispeedia.ipynb.
+It now uses the same robust page fetching and link parsing logic as wikispeedai.py.
 """
 
 import json
@@ -13,97 +13,105 @@ from pathlib import Path
 import wikipedia
 from bs4 import BeautifulSoup
 from urllib.parse import unquote
+import logging
+from typing import List, Tuple, Optional
 
+# --- Functions copied from wikispeedai.py for identical logic ---
 
-def get_wikipedia_page(title):
-    """
-    Carica una pagina Wikipedia dato il titolo.
-    Gestisce errori di disambiguazione, redirect e pagine non trovate.
-    Same logic as wikispeedia.ipynb.
-    """
+def get_wikipedia_page(title: str) -> Tuple[str, any]:
+    """Loads a Wikipedia page with error handling. Identical to wikispeedai.py."""
     try:
-        # Prova a cercare la pagina con il titolo esatto
-        page = wikipedia.page(title, auto_suggest=False)
-        return page
-    except wikipedia.exceptions.PageError:
-        # Se non trova la pagina, prova con auto_suggest=True
-        try:
-            print(f'  Page "{title}" not found, trying with suggestions...')
-            page = wikipedia.page(title, auto_suggest=True)
-            print(f'  Found alternative: {page.title}')
-            return page
-        except Exception as e:
-            print(f'  Still not found: {title}')
-            return None
+        page = wikipedia.page(title, auto_suggest=False, redirect=True)
+        return 'success', page
     except wikipedia.exceptions.DisambiguationError as e:
-        # Se sono presenti più opzioni utilizziamo la prima presente
-        print(f'  Disambiguation for {title}, using {e.options[0]}')
+        logging.info(f"'{title}' is a disambiguation page. Returning options.")
+        return 'disambiguation', e.options
+    except wikipedia.exceptions.PageError:
+        logging.info(f"Page '{title}' not found. Trying with auto-suggest...")
         try:
-            return wikipedia.page(e.options[0])
-        except Exception:
-            return None
+            page = wikipedia.page(title, auto_suggest=True, redirect=True)
+            logging.info(f"Found alternative page: '{page.title}'")
+            return 'success', page
+        except wikipedia.exceptions.DisambiguationError as e:
+            logging.warning(f"Suggestion for '{title}' also led to a disambiguation.")
+            return 'disambiguation', e.options
+        except wikipedia.exceptions.PageError:
+            logging.error(f"No page found for '{title}', even with suggestions.")
+            return 'not_found', None
+        except Exception as e:
+            logging.error(f"Unexpected error during auto-suggest for '{title}': {e}")
+            return 'error', str(e)
     except Exception as e:
-        print(f'  Error loading page {title}: {e}')
-        return None
+        logging.error(f"Unexpected error while loading '{title}': {e}")
+        return 'error', str(e)
 
-
-def get_page_links(page, exclude_keywords=None):
-    """Extract links from a Wikipedia page in order of appearance."""
+def get_page_links(page, exclude_keywords: Optional[List[str]] = None) -> List[Tuple[str, str]]:
+    """Fetches a Wikipedia page HTML and extracts internal links. Identical to wikispeedai.py."""
     if not page:
         return []
-    
-    # Define keywords for non-content pages to exclude
-    exclude = exclude_keywords or ['Category:', 'Template:', 'File:', 'Portal:', 
-                                   'Help:', 'Wikipedia:', 'Talk:', 'Special:']
+
+    exclude = exclude_keywords or [
+        'Category:', 'Template:', 'File:', 'Portal:', 'Help:', 'Wikipedia:',
+        'Talk:', 'Special:', 'Template talk:'
+    ]
     
     try:
-        from urllib.parse import unquote
-        # Parse HTML to extract links in their actual order
         soup = BeautifulSoup(page.html(), 'html.parser')
-        content = soup.find('div', {'id': 'mw-content-text'})
+        content = soup.find('div', {'id': 'mw-content-text'}) or soup.find('div', {'class': 'mw-parser-output'})
         
-        # Fallback to default links if HTML parsing fails
         if not content:
-            try:
-                return [l for l in page.links if not any(kw in l for kw in exclude)]
-            except (KeyError, AttributeError) as e:
-                print(f"Error accessing page.links: {e}")
-                return []
-        
-        seen = set()
-        links = []
-        
-        # Extract all wiki links from content
-        for a in content.find_all('a', href=True):
-            href = a.get('href', '')
-            if not href.startswith('/wiki/'):
-                continue
-            
-            # Decode URL and convert to readable title
-            title = unquote(href.replace('/wiki/', '').replace('_', ' '))
-            
-            # Skip excluded pages and duplicates
-            if any(kw in title for kw in exclude) or title in seen:
-                continue
-            
-            seen.add(title)
-            links.append(title)
-        
-        return links
-    
-    except Exception as e:
-        print(f"Error parsing HTML: {e}, using fallback")
-        try:
-            return [l for l in page.links if not any(kw in l for kw in exclude)]
-        except (KeyError, AttributeError) as fallback_error:
-            print(f"Fallback also failed: {fallback_error}. Returning empty list.")
+            logging.warning(f"Could not find the main content area for page '{page.title}'.")
             return []
 
-def get_wikipedia_links(title, max_retries=3):
-    """Get all hyperlinks from a Wikipedia page using wikipedia library."""
-    page = get_wikipedia_page(title)
+        seen_anchors, links = set(), []
+        for a in content.find_all('a', href=True):
+            href = a.get('href', '')
+            
+            if href.startswith('/wiki/'):
+                page_title = unquote(href.replace('/wiki/', '')).replace('_', ' ')
+
+                if '#' not in page_title and not any(kw in page_title for kw in exclude):
+                    anchor_text = a.get_text(strip=True)
+                    
+                    if anchor_text and not (anchor_text.startswith('[') and anchor_text.endswith(']')) and anchor_text not in seen_anchors:
+                        seen_anchors.add(anchor_text)
+                        links.append((anchor_text, page_title))
+        return links
+        
+    except Exception as e:
+        logging.error(f"An error occurred while parsing HTML for links in page '{page.title}': {e}")
+        return []
+
+# --- Adapted function to bridge new logic with script's purpose ---
+
+def get_wikipedia_links(title: str) -> List[str]:
+    """
+    Get all hyperlink titles from a Wikipedia page.
+    This function uses the robust page fetching and parsing logic and adapts the
+    output to what this script requires (a list of page titles).
+    """
+    # In case of disambiguation, this script will just take the first option.
+    status, result = get_wikipedia_page(title)
+    
+    page = None
+    if status == 'success':
+        page = result
+    elif status == 'disambiguation':
+        first_option = result[0] if result else None
+        if first_option:
+            print(f"  Disambiguation for '{title}', using first option: '{first_option}'")
+            status, page = get_wikipedia_page(first_option)
+            if status != 'success':
+                return []
+        else:
+            return []
+
     if page:
-        return get_page_links(page)
+        # get_page_links now returns List[Tuple[anchor, title]]
+        # This script only needs the titles.
+        links_with_anchors = get_page_links(page)
+        return [link_title for anchor, link_title in links_with_anchors]
+        
     return []
 
 def main():
@@ -133,9 +141,10 @@ def main():
     for json_file in json_files:
         with open(json_file, 'r', encoding='utf-8') as f:
             result = json.load(f)
-            if result.get("success"):
-                path = result.get("path", [])
-                all_pages.update(path)
+            # Considering all paths, not just successful ones, might be better
+            # to capture all visited nodes.
+            path = result.get("path", [])
+            all_pages.update(path)
     
     print(f"Found {len(all_pages)} unique pages\n")
     
@@ -143,6 +152,9 @@ def main():
     wikipedia_links = {}
     failed_pages = []
     
+    # Setup basic logging for the functions that need it
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
     for i, page in enumerate(sorted(all_pages), 1):
         print(f"[{i}/{len(all_pages)}] {page}")
         links = get_wikipedia_links(page)
@@ -154,15 +166,16 @@ def main():
         else:
             print(f"  {len(links)} links")
         
-        time.sleep(0.5)  # Be nice to Wikipedia
+        time.sleep(0.1)  # Be nice to Wikipedia
     
     # Save to file
     with open(output_file, 'wb') as f:
         pickle.dump(wikipedia_links, f)
     
-    print(f"Total pages: {len(wikipedia_links)}")
+    print(f"\nTotal pages: {len(wikipedia_links)}")
     print(f"Total links: {sum(len(links) for links in wikipedia_links.values())}")
-    print(f"Avg links per page: {sum(len(links) for links in wikipedia_links.values()) / len(wikipedia_links):.1f}")
+    if len(wikipedia_links) > 0:
+        print(f"Avg links per page: {sum(len(links) for links in wikipedia_links.values()) / len(wikipedia_links):.1f}")
     if failed_pages:
         print(f"\nFailed pages ({len(failed_pages)}): {failed_pages}")
     print(f"Saved to: {output_file}")
