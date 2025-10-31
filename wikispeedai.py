@@ -3,15 +3,15 @@ import requests
 import json
 from datetime import datetime
 import warnings
-from tqdm import tqdm
 import os
+import sys
 from bs4 import BeautifulSoup
 from difflib import SequenceMatcher
 import random
 from urllib.parse import unquote
 import csv
 import logging
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional, Set, Callable, Any
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from enum import Enum
@@ -29,22 +29,6 @@ class Personality(Enum):
     BUSYBODY = "busybody"
     HUNTER = "hunter"
     DANCER = "dancer"
-
-
-class Temperature(Enum):
-    """Predefined temperature values for LLM experimentation."""
-    LOW = 0.3
-    MEDIUM = 0.7
-    HIGH = 1.0
-    VERY_HIGH = 1.5
-    
-    @classmethod
-    def from_value(cls, value: float) -> 'Temperature':
-        """Find the closest predefined temperature or create custom."""
-        for temp in cls:
-            if abs(temp.value - value) < 0.01:
-                return temp
-        return value
 
 
 @dataclass
@@ -100,29 +84,28 @@ class NavigationResult:
 
 class WikiNavigator:
     """Wikipedia navigation experiment using LLM with different personalities and temperatures."""
-    
+
     def __init__(self, config_file: str = 'config.json'):
         """Initialize the WikiNavigator with configuration."""
         wikipedia.set_lang('en')
         warnings.filterwarnings('ignore')
-        
+
         self.config = self._load_config(config_file)
         self.all_available_links_set: Set[Tuple[str, str]] = set()
         self.all_chosen_links_set: Set[Tuple[str, str]] = set()
-        
-        self.cache_dir = Path(__file__).parent / "wiki_cache"
+
+        base_dir = Path(__file__).parent
+        self.cache_dir = base_dir / "wiki_cache"
+        self.content_cache_dir = base_dir / "wiki_content"
         self.cache_dir.mkdir(exist_ok=True)
-        
-        # Cache directory for full content (renamed from summaries)
-        self.content_cache_dir = Path(__file__).parent / "wiki_content"
         self.content_cache_dir.mkdir(exist_ok=True)
-        
+
         self._setup_logging()
-        
+
         logging.info(f"Using backend: {self.config['backend']}")
         logging.info(f"Using model: {self.config['model_name']}")
         logging.info(f"Output directory: {self.config['output_dir']}")
-    
+
     def _setup_logging(self) -> None:
         """Configure logging with file and console handlers."""
         log_dir = Path(__file__).parent / "logs"
@@ -136,7 +119,7 @@ class WikiNavigator:
         file_handler.setLevel(logging.INFO)
         file_handler.setFormatter(detailed_formatter)
 
-        console_handler = logging.StreamHandler()
+        console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(logging.WARNING)
         console_handler.setFormatter(simple_formatter)
 
@@ -147,53 +130,39 @@ class WikiNavigator:
         logger.setLevel(logging.INFO)
         logger.addHandler(file_handler)
         logger.addHandler(console_handler)
-    
-    def _console_print(self, message: str) -> None:
-        """Print directly to console bypassing logging filters."""
-        print(message)
-    
-    def _get_lm_studio_model_name(self, lm_studio_url: str, timeout: int = 120) -> str:
+
+    def _get_model_name_from_api(self, url: str, method: str) -> str:
+        """Helper to retrieve model name from LM Studio or Ollama."""
+        try:
+            response = requests.get(url, timeout=self.config.get('model_detection_timeout', 120))
+            response.raise_for_status()
+            result = response.json()
+            
+            if method == 'lm_studio':
+                if 'data' in result and len(result['data']) > 0:
+                    return result['data'][0].get('id', 'lm_studio')
+            elif method == 'ollama':
+                if 'models' in result and len(result['models']) > 0:
+                    return result['models'][0].get('name', 'ollama')
+                    
+            logging.warning(f"No model found in {method} response, using default '{method}'")
+            return method
+        except Exception as e:
+            logging.error(f"Could not retrieve model name from {method}: {e}")
+            logging.warning(f"Using default '{method}' as model name")
+            return method
+
+    def _get_lm_studio_model_name(self, lm_studio_url: str) -> str:
         """Retrieve the current model name from LM Studio API."""
-        try:
-            models_url = lm_studio_url.replace('/v1/chat/completions', '/v1/models')
-            response = requests.get(models_url, timeout=timeout)
-            response.raise_for_status()
-            result = response.json()
-            if 'data' in result and len(result['data']) > 0:
-                model_name = result['data'][0].get('id', 'lm_studio')
-                logging.info(f"Auto-detected LM Studio model: {model_name}")
-                return model_name
-            else:
-                logging.warning("No model found in LM Studio response, using default 'lm_studio'")
-                return 'lm_studio'
-        except Exception as e:
-            logging.error(f"Could not retrieve model name from LM Studio: {e}")
-            logging.warning("Using default 'lm_studio' as model name")
-            return 'lm_studio'
-    
-    def _get_ollama_model_name(self, ollama_url: str, timeout: int = 120) -> str:
+        models_url = lm_studio_url.replace('/v1/chat/completions', '/v1/models')
+        return self._get_model_name_from_api(models_url, 'lm_studio')
+
+    def _get_ollama_model_name(self, ollama_url: str) -> str:
         """Retrieve the current model name from Ollama API."""
-        try:
-            # Get the base URL (remove /api/chat or /api/generate)
-            base_url = ollama_url.rsplit('/api/', 1)[0]
-            tags_url = f"{base_url}/api/tags"
-            
-            response = requests.get(tags_url, timeout=timeout)
-            response.raise_for_status()
-            result = response.json()
-            
-            if 'models' in result and len(result['models']) > 0:
-                model_name = result['models'][0].get('name', 'ollama')
-                logging.info(f"Auto-detected Ollama model: {model_name}")
-                return model_name
-            else:
-                logging.warning("No model found in Ollama response, using default 'ollama'")
-                return 'ollama'
-        except Exception as e:
-            logging.error(f"Could not retrieve model name from Ollama: {e}")
-            logging.warning("Using default 'ollama' as model name")
-            return 'ollama'
-    
+        base_url = ollama_url.rsplit('/api/', 1)[0]
+        tags_url = f"{base_url}/api/tags"
+        return self._get_model_name_from_api(tags_url, 'ollama')
+
     def _load_config(self, config_file: str) -> Dict:
         """Load and validate configuration from config.json."""
         config_path = Path(config_file)
@@ -203,31 +172,32 @@ class WikiNavigator:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
 
-        # Determine backend
+        backend_info = {
+            'lm_studio': {
+                'url_key': 'lm_studio_url',
+                'default_url': 'http://localhost:1234/v1/chat/completions',
+                'detector': self._get_lm_studio_model_name
+            },
+            'ollama': {
+                'url_key': 'ollama_url',
+                'default_url': 'http://localhost:11434/api/chat',
+                'detector': self._get_ollama_model_name
+            }
+        }
+
         backend = config.get('backend', 'lm_studio').lower()
-        if backend not in ['lm_studio', 'ollama']:
+        if backend not in backend_info:
             logging.warning(f"Invalid backend '{backend}', defaulting to 'lm_studio'")
             backend = 'lm_studio'
         config['backend'] = backend
 
-        # Set appropriate URL based on backend
-        if backend == 'lm_studio':
-            config['backend_url'] = config.get('lm_studio_url', "http://localhost:1234/v1/chat/completions")
-            if 'model_name' not in config or not config['model_name']:
-                logging.info("Model name not specified, auto-detecting from LM Studio...")
-                config['model_name'] = self._get_lm_studio_model_name(
-                    config['backend_url'],
-                    timeout=config.get('model_detection_timeout', 120)
-                )
-        else:  # ollama
-            config['backend_url'] = config.get('ollama_url', "http://localhost:11434/api/chat")
-            if 'model_name' not in config or not config['model_name']:
-                logging.info("Model name not specified, auto-detecting from Ollama...")
-                config['model_name'] = self._get_ollama_model_name(
-                    config['backend_url'],
-                    timeout=config.get('model_detection_timeout', 120)
-                )
-        
+        info = backend_info[backend]
+        config['backend_url'] = config.get(info['url_key'], info['default_url'])
+
+        if 'model_name' not in config or not config['model_name']:
+            logging.info(f"Model name not specified, auto-detecting from {backend}...")
+            config['model_name'] = info['detector'](config['backend_url'])
+
         model_name = config['model_name']
         config['output_dir'] = model_name.replace('/', '_').replace(':', '_').replace('\\', '_')
 
@@ -235,16 +205,15 @@ class WikiNavigator:
         config['start_pages'] = [sp] if isinstance(sp, str) else sp
         t = config.get('temperatures', [0.3])
         config['temperatures'] = [t] if isinstance(t, (int, float)) else t
-        
+
         valid_personalities = [p.value for p in Personality]
-        config['personalities'] = [p for p in config.get('personalities', ['baseline']) 
-                                   if p in valid_personalities]
+        config['personalities'] = [p for p in config.get('personalities', ['baseline']) if p in valid_personalities]
         if not config['personalities']:
             logging.warning("No valid personalities found in config, using baseline")
             config['personalities'] = [Personality.BASELINE.value]
-        
+
         return config
-    
+
     def create_navigation_prompt(self, current_article: str, target_article: str,
                                  links: List[str], path: List[str],
                                  page_content: Optional[str] = None) -> str:
@@ -296,74 +265,50 @@ class WikiNavigator:
 
     def call_llm(self, messages: List[Dict], temperature: float = 0.3) -> Optional[str]:
         """Call LLM API (LM Studio or Ollama based on configuration)."""
-        if self.config['backend'] == 'lm_studio':
-            return self._call_lm_studio(messages, temperature)
-        else:
-            return self._call_ollama(messages, temperature)
-
-    def _call_lm_studio(self, messages: List[Dict], temperature: float = 0.3) -> Optional[str]:
-        """Call LM Studio API."""
-        payload = {
-            "model": self.config.get('model_name', 'local-model'),
-            "messages": messages, 
-            "temperature": temperature,
-            "max_tokens": -1,
-            "stream": False
-        }
-        try:
-            response = requests.post(
-                self.config['backend_url'], 
-                json=payload, 
-                timeout=self.config.get('api_timeout', 1200)
-            )
-            response.raise_for_status()
-            result = response.json()
-            return result['choices'][0]['message']['content'].strip()
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Error calling LM Studio: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                logging.error(f"Response content: {e.response.text}")
-            return None
-
-    def _call_ollama(self, messages: List[Dict], temperature: float = 0.3) -> Optional[str]:
-        """Call Ollama API with improved configuration."""
-        payload = {
-            "model": self.config.get('model_name', 'llama2'),
-            "messages": messages,
-            "stream": False,
-            "options": {
+        backend = self.config['backend']
+        url = self.config['backend_url']
+        model = self.config.get('model_name', 'local-model')
+        timeout = self.config.get('api_timeout', 1200)
+        payload = {}
+        
+        if backend == 'lm_studio':
+            payload = {
+                "model": model,
+                "messages": messages,
                 "temperature": temperature,
-                "num_predict": 1024,  # Max tokens for response
-                "top_p": 0.9,
-                "top_k": 40,
-            },
-            "format": "json"  # Force JSON output for Ollama
-        }
+                "max_tokens": -1,
+                "stream": False
+            }
+        elif backend == 'ollama':
+            payload = {
+                "model": model,
+                "messages": messages,
+                "stream": False,
+                "options": {
+                    "temperature": temperature,
+                },
+                "format": "json"
+            }
+        
         try:
-            response = requests.post(
-                self.config['backend_url'],
-                json=payload,
-                timeout=self.config.get('api_timeout', 1200)
-            )
+            response = requests.post(url, json=payload, timeout=timeout)
             response.raise_for_status()
             result = response.json()
-            
-            # Debug logging for Ollama
-            logging.info(f"Ollama response keys: {result.keys()}")
-            if 'message' not in result:
-                logging.error(f"Unexpected Ollama response format: {result}")
-                return None
+
+            if backend == 'lm_studio':
+                return result['choices'][0]['message']['content'].strip()
+            elif backend == 'ollama':
+                content = result.get('message', {}).get('content', '').strip()
+                logging.info(f"Ollama raw response: {content[:200]}...")
+                return content
                 
-            content = result['message']['content'].strip()
-            logging.info(f"Ollama raw response: {content[:200]}...")
-            return content
-            
         except requests.exceptions.RequestException as e:
-            logging.error(f"Error calling Ollama: {e}")
+            logging.error(f"Error calling {backend} at {url}: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 logging.error(f"Response content: {e.response.text}")
-            return None
-    
+        
+        return None
+
     def get_personality_prompt(self, personality: str = "baseline") -> str:
         """Get the combined system prompt for a given personality."""
         traits = self.config.get('personality_traits', {}).get(personality)
@@ -374,14 +319,14 @@ class WikiNavigator:
 
         baseline_prompt = self.config['prompts']['baseline']
         
-        # Add extra clarity for Ollama
+        json_instruction = ''
         if self.config['backend'] == 'ollama':
             json_instruction = '\n\nIMPORTANT: You MUST respond with valid JSON only. Format: {"link": "exact_link_text", "reason": "brief explanation"}'
-            return f"{baseline_prompt}\n{traits}{json_instruction}" if traits else f"{baseline_prompt}{json_instruction}"
         
-        return f"{baseline_prompt}\n{traits}" if traits else baseline_prompt
-    
-    def get_wikipedia_page(self, title: str) -> Tuple[str, any]:
+        full_prompt = f"{baseline_prompt}\n{traits}" if traits else baseline_prompt
+        return f"{full_prompt}{json_instruction}"
+
+    def get_wikipedia_page(self, title: str) -> Tuple[str, Any]:
         """Loads a Wikipedia page with error handling."""
         try:
             page = wikipedia.page(title, auto_suggest=False, redirect=True)
@@ -408,47 +353,36 @@ class WikiNavigator:
             logging.error(f"Unexpected error while loading '{title}': {e}")
             return 'error', str(e)
 
-    def _get_cached_page_content(self, page) -> str:
-        """Loads full page content from cache or fetches and saves it."""
-        safe_title = "".join(c for c in page.title if c.isalnum() or c in (' ', '_')).rstrip()
-        cache_file = self.content_cache_dir / f"{safe_title}.txt"
+    def _get_cached_resource(self, page_title: str, cache_dir: Path,
+                             file_ext: str, fetch_callable: Callable[[], str]) -> str:
+        """Generic helper to cache and retrieve a page resource (HTML or content)."""
+        safe_title = "".join(c for c in page_title if c.isalnum() or c in (' ', '_')).rstrip()
+        cache_file = cache_dir / f"{safe_title}.{file_ext}"
 
         if cache_file.exists():
-            logging.info(f"CONTENT CACHE HIT: Loading '{page.title}' content from cache.")
+            logging.info(f"{file_ext.upper()} CACHE HIT: Loading '{page_title}' from cache.")
             with open(cache_file, 'r', encoding='utf-8') as f:
                 return f.read()
         else:
-            logging.info(f"CONTENT CACHE MISS: Fetching '{page.title}' content and caching.")
+            logging.info(f"{file_ext.upper()} CACHE MISS: Fetching '{page_title}' and caching.")
             try:
-                content = page.content  # Full content instead of summary
+                content = fetch_callable()
                 with open(cache_file, 'w', encoding='utf-8') as f:
                     f.write(content)
                 return content
             except Exception as e:
-                logging.error(f"Could not fetch or cache content for '{page.title}': {e}")
+                logging.error(f"Could not fetch or cache {file_ext} for '{page_title}': {e}")
                 return ""
 
-    def _get_cached_page_html(self, page) -> str:
+    def _get_cached_page_content(self, page: Any) -> str:
+        """Loads full page content from cache or fetches and saves it."""
+        return self._get_cached_resource(page.title, self.content_cache_dir, "txt", lambda: page.content)
+
+    def _get_cached_page_html(self, page: Any) -> str:
         """Loads page HTML from cache or fetches and saves it."""
-        safe_title = "".join(c for c in page.title if c.isalnum() or c in (' ', '_')).rstrip()
-        cache_file = self.cache_dir / f"{safe_title}.html"
+        return self._get_cached_resource(page.title, self.cache_dir, "html", lambda: page.html())
 
-        if cache_file.exists():
-            logging.info(f"HTML CACHE HIT: Loading '{page.title}' from cache.")
-            with open(cache_file, 'r', encoding='utf-8') as f:
-                return f.read()
-        else:
-            logging.info(f"HTML CACHE MISS: Fetching '{page.title}' from Wikipedia and caching.")
-            try:
-                html_content = page.html()
-                with open(cache_file, 'w', encoding='utf-8') as f:
-                    f.write(html_content)
-                return html_content
-            except Exception as e:
-                logging.error(f"Could not fetch or cache page '{page.title}': {e}")
-                return ""
-    
-    def get_page_links(self, page, exclude_keywords: Optional[List[str]] = None) -> Tuple[List[Tuple[str, str]], str]:
+    def get_page_links(self, page: Any, exclude_keywords: Optional[List[str]] = None) -> Tuple[List[Tuple[str, str]], str]:
         """Fetches a Wikipedia page HTML from cache or web and extracts internal links and full text content."""
         if not page:
             return [], ""
@@ -459,7 +393,6 @@ class WikiNavigator:
         ]
         
         try:
-            # Get both HTML and full content
             html_content = self._get_cached_page_html(page)
             full_content = self._get_cached_page_content(page)
             
@@ -467,17 +400,14 @@ class WikiNavigator:
                 return [], full_content
 
             soup = BeautifulSoup(html_content, 'html.parser')
-            content = soup.find('div', {'id': 'mw-content-text'}) or soup.find('div', {'class': 'mw-parser-output'})
+            content_div = soup.find('div', {'id': 'mw-content-text'}) or soup.find('div', {'class': 'mw-parser-output'})
             
-            if not content:
+            if not content_div:
                 logging.warning(f"Could not find the main content area for page '{page.title}'.")
                 return [], full_content
 
-            # Use full content from page.content
-            page_text = full_content
-
             seen_anchors, links = set(), []
-            for a in content.find_all('a', href=True):
+            for a in content_div.find_all('a', href=True):
                 href = a.get('href', '')
                 
                 if href.startswith('/wiki/'):
@@ -489,21 +419,21 @@ class WikiNavigator:
                         if anchor_text and not (anchor_text.startswith('[') and anchor_text.endswith(']')) and anchor_text not in seen_anchors:
                             seen_anchors.add(anchor_text)
                             links.append((anchor_text, page_title))
-            return links, page_text
+            return links, full_content
             
         except Exception as e:
             logging.error(f"An error occurred while parsing HTML for links in page '{page.title}': {e}")
-            return [], "" 
-    
+            return [], ""
+
     @staticmethod
     def fuzzy_similarity(s1: str, s2: str) -> float:
         """Calculate fuzzy similarity between two strings."""
         return SequenceMatcher(None, s1.lower(), s2.lower()).ratio()
-    
-    def parse_model_choice(self, response: Optional[str], 
-                          available_links: List[str]) -> Tuple[Optional[str], Dict]:
+
+    def parse_model_choice(self, response: Optional[str],
+                             available_links: List[str]) -> Tuple[Optional[str], Dict]:
         """Parse the model's response and match it to an available link."""
-        if not response: 
+        if not response:
             return None, {}
         
         metadata = {"fallback_used": False, "match_type": "unknown", "similarity_score": 0.0, "reason": "", "raw_choice": ""}
@@ -518,7 +448,7 @@ class WikiNavigator:
             metadata["reason"] = "No reason provided (non-JSON response)"
         
         metadata["raw_choice"] = chosen_text
-        if not chosen_text: 
+        if not chosen_text:
             return None, metadata
 
         for link in available_links:
@@ -528,8 +458,8 @@ class WikiNavigator:
 
         threshold = self.config.get('fuzzy_match_threshold', 0.95)
         best_link, best_score = max(
-            ((link, self.fuzzy_similarity(chosen_text, link)) for link in available_links), 
-            key=lambda item: item[1], 
+            ((link, self.fuzzy_similarity(chosen_text, link)) for link in available_links),
+            key=lambda item: item[1],
             default=(None, 0.0)
         )
         
@@ -541,10 +471,10 @@ class WikiNavigator:
         metadata.update({"fallback_used": True, "match_type": "no_match_hallucination", "similarity_score": best_score})
         logging.warning(f"HALLUCINATION: No match for '{chosen_text}' (best: {best_score:.2f})")
         return None, metadata
-    
-    def _handle_page_loading(self, current_page_title: str, target_article: str, 
-                           path: List[str], system_prompt: str, 
-                           temperature: float, max_attempts: int) -> Tuple[any, Optional[str]]:
+
+    def _handle_page_loading(self, current_page_title: str, target_article: str,
+                             path: List[str], system_prompt: str,
+                             temperature: float, max_attempts: int) -> Tuple[Any, Optional[str]]:
         """Handles page loading, including disambiguation resolution."""
         page, status = None, ''
         temp_current = current_page_title
@@ -576,15 +506,18 @@ class WikiNavigator:
             return None, "page_load_unknown_error"
             
         return page, None
-    
-    def _get_llm_choice(self, page_title: str, page_content: str, target_article: str, path: List[str], 
-                       available_anchors: List[str], system_prompt: str, 
-                       temperature: float, max_attempts: int) -> Tuple[Optional[str], Dict, Optional[str]]:
+
+    def _get_llm_choice(self, page_title: str, page_content: str, target_article: str, path: List[str],
+                        available_anchors: List[str], system_prompt: str,
+                        temperature: float, max_attempts: int) -> Tuple[Optional[str], Dict, Optional[str]]:
         """Handles LLM choice, including self-correction loop."""
         chosen_anchor, metadata = None, {}
         
         for attempt in range(max_attempts):
-            prompt = self.create_navigation_prompt(page_title, target_article, available_anchors, path, page_content) if attempt == 0 else self.create_correction_prompt(metadata.get("raw_choice"), target_article, available_anchors, path)
+            if attempt == 0:
+                prompt = self.create_navigation_prompt(page_title, target_article, available_anchors, path, page_content)
+            else:
+                prompt = self.create_correction_prompt(metadata.get("raw_choice"), target_article, available_anchors, path)
             
             response = self.call_llm([{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}], temperature)
             if not response:
@@ -598,7 +531,7 @@ class WikiNavigator:
                 
         logging.warning("LLM failed to provide a valid link after retries. Halting.")
         return None, metadata, "hallucination_max_retries_exceeded"
-    
+
     def _calculate_final_statistics(self, detailed_steps: List[NavigationStep], success: bool) -> FallbackStatistics:
         """Calculate fallback and other statistics from the detailed steps of a run."""
         stats = FallbackStatistics()
@@ -608,12 +541,12 @@ class WikiNavigator:
 
         stats.steps_with_fallback = [s.step_number for s in detailed_steps if s.fallback_used]
         stats.total_fallbacks = len(stats.steps_with_fallback)
-        stats.fuzzy_match_fallbacks = len([s for s in detailed_steps if s.match_type == "fuzzy_match"])
-        stats.total_hallucinations = len([s for s in detailed_steps if s.match_type == "no_match_hallucination"])
+        stats.fuzzy_match_fallbacks = sum(1 for s in detailed_steps if s.match_type == "fuzzy_match")
+        stats.total_hallucinations = sum(1 for s in detailed_steps if s.match_type == "no_match_hallucination")
         
-        stats.fallback_rate = (stats.total_fallbacks / total_steps) * 100
+        stats.fallback_rate = (stats.total_fallbacks / total_steps) * 100 if total_steps > 0 else 0
 
-        sim_scores = [s.similarity_score for s in detailed_steps if s.similarity_score > 0 and s.match_type == "fuzzy_match"]
+        sim_scores = [s.similarity_score for s in detailed_steps if s.match_type == "fuzzy_match"]
         if sim_scores:
             stats.avg_similarity_score = sum(sim_scores) / len(sim_scores)
 
@@ -624,9 +557,9 @@ class WikiNavigator:
         
         return stats
 
-    def run_navigation_experiment(self, start_article: str, target_article: str, 
-                                 temperature: float = 0.3, 
-                                 personality: str = "baseline") -> NavigationResult:
+    def run_navigation_experiment(self, start_article: str, target_article: str,
+                                  temperature: float = 0.3,
+                                  personality: str = "baseline") -> NavigationResult:
         """Run a single navigation experiment."""
         start_time = datetime.now()
         
@@ -644,12 +577,12 @@ class WikiNavigator:
             if current.lower() == target_article.lower():
                 success = True
                 elapsed = (datetime.now() - start_time).total_seconds()
-                self._console_print(f"  🎯 TARGET REACHED in {step} steps! ({elapsed:.1f}s)")
+                print(f"  TARGET REACHED in {step} steps! ({elapsed:.1f}s)")
                 break
             
             page, error_type = self._handle_page_loading(current, target_article, path, system_prompt, temperature, max_correction_attempts)
             if error_type:
-                self._console_print(f"  ❌ ERROR: {error_type}")
+                print(f"  ERROR: {error_type}")
                 break
             current = page.title
 
@@ -661,24 +594,24 @@ class WikiNavigator:
             if not available_links_map:
                 logging.warning("Dead end reached.")
                 error_type = "dead_end_no_links"
-                self._console_print(f"  ❌ DEAD END at '{current}'")
+                print(f"  DEAD END at '{current}'")
                 break
             
             available_anchors = list(available_links_map.keys())
             
             chosen_anchor, metadata, error_type = self._get_llm_choice(
-                page.title, page_content, target_article, path, 
+                page.title, page_content, target_article, path,
                 available_anchors, system_prompt, temperature, max_correction_attempts
             )
             
             if metadata.get("fallback_used"):
-                if metadata["match_type"] == "fuzzy_match": 
-                    self._console_print(f"  ⚠️  Step {step}: {current} → {available_links_map.get(chosen_anchor, '?')} (fuzzy: {metadata['similarity_score']:.2f})")
-                elif metadata["match_type"] == "no_match_hallucination": 
-                    self._console_print(f"  ⚠️  Step {step}: Hallucination detected")
+                if metadata["match_type"] == "fuzzy_match":
+                    print(f"  Step {step}: {current} -> {available_links_map.get(chosen_anchor, '?')} (fuzzy: {metadata['similarity_score']:.2f})")
+                elif metadata["match_type"] == "no_match_hallucination":
+                    print(f"  Step {step}: Hallucination detected")
             
             if error_type:
-                self._console_print(f"  ❌ ERROR: {error_type}")
+                print(f"  ERROR: {error_type}")
                 break
                 
             chosen_title = available_links_map[chosen_anchor]
@@ -687,14 +620,14 @@ class WikiNavigator:
 
             transition = (current.lower(), chosen_title.lower())
             recent_transitions.append(transition)
-            if len(recent_transitions) > max_loop_repetitions * 2: 
+            if len(recent_transitions) > max_loop_repetitions * 2:
                 recent_transitions.pop(0)
             
             if recent_transitions.count(transition) >= max_loop_repetitions:
                 loop_detected = True
                 error_type = "loop_detected"
                 logging.warning(f"LOOP DETECTED: Transition '{current}' -> '{chosen_title}' repeated.")
-                self._console_print(f"  🔄 LOOP DETECTED: {current} ↔ {chosen_title}")
+                print(f"  LOOP DETECTED: {current} <-> {chosen_title}")
                 break
                 
             detailed_steps.append(NavigationStep(
@@ -720,9 +653,9 @@ class WikiNavigator:
         fallback_stats = self._calculate_final_statistics(detailed_steps, success)
 
         if success:
-            self._console_print(f"  ✅ SUCCESS in {step} steps | Fallbacks: {fallback_stats.total_fallbacks} ({fallback_stats.fallback_rate:.1f}%) | Time: {elapsed_time:.1f}s")
+            print(f"  SUCCESS in {step} steps | Fallbacks: {fallback_stats.total_fallbacks} ({fallback_stats.fallback_rate:.1f}%) | Time: {elapsed_time:.1f}s")
         else:
-            self._console_print(f"  ❌ FAILED: {error_type} after {step} steps | Time: {elapsed_time:.1f}s")
+            print(f"  FAILED: {error_type} after {step} steps | Time: {elapsed_time:.1f}s")
 
         return NavigationResult(
             success=success,
@@ -740,9 +673,9 @@ class WikiNavigator:
             loop_detected=loop_detected,
             error_type=error_type
         )
-    
-    def save_individual_result(self, result: NavigationResult, start_page: str, 
-                             temp: float, personality: str, iteration: int) -> None:
+
+    def save_individual_result(self, result: NavigationResult, start_page: str,
+                               temp: float, personality: str, iteration: int) -> None:
         """Saves a single experiment result to a structured directory."""
         temp_str = str(temp).replace('.', '_')
         output_dir = Path(self.config['output_dir']) / f"temp_{temp_str}_personality_{personality}" / start_page.replace(' ', '_')
@@ -752,9 +685,9 @@ class WikiNavigator:
         self.save_detailed_links_csv(result.detailed_steps, detailed_csv_filename)
 
         result_dict = asdict(result)
-        for step in result_dict.get('detailed_steps', []):
-            if 'available_links_map' in step:
-                del step['available_links_map']
+        for step_data in result_dict.get('detailed_steps', []):
+            if 'available_links_map' in step_data:
+                del step_data['available_links_map']
 
         filename = output_dir / f"result_{iteration+1:03d}.json"
         with open(filename, 'w', encoding='utf-8') as f:
@@ -771,7 +704,19 @@ class WikiNavigator:
                         writer.writerow([step.step_number, step.origin_page, anchor, title])
         except Exception as e:
             logging.error(f"Error writing detailed links CSV {filename}: {e}")
-    
+
+    def _write_csv_report(self, filename: str, data: List[Tuple[str, str]],
+                          description: str, headers: List[str]) -> None:
+        """Helper method to write CSV reports with error handling."""
+        try:
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+                writer.writerows(data)
+            logging.info(f"Saved {len(data)} unique {description} to {filename}")
+        except Exception as e:
+            logging.error(f"Error writing {filename}: {e}")
+
     def save_csv_reports(self) -> None:
         """Write summary CSV files for available and chosen links."""
         logging.info("\nWriting summary CSV files...")
@@ -800,9 +745,9 @@ class WikiNavigator:
         summary_filename = output_dir / "experiment_summary.csv"
         
         headers = [
-            "iteration_in_group", "success", "steps", "start", "target", 
-            "temperature", "personality", "backend", "total_pages_visited", 
-            "loop_detected", "error_type", "total_fallbacks", 
+            "iteration_in_group", "success", "steps", "start", "target",
+            "temperature", "personality", "backend", "total_pages_visited",
+            "loop_detected", "error_type", "total_fallbacks",
             "fallback_rate", "total_hallucinations", "avg_similarity_score",
             "path"
         ]
@@ -832,22 +777,10 @@ class WikiNavigator:
                     }
                     writer.writerow(row)
             logging.info(f"Summary of all experiments saved to {summary_filename}")
-            self._console_print(f"Summary CSV saved to: {summary_filename}")
+            print(f"Summary CSV saved to: {summary_filename}")
         except Exception as e:
             logging.error(f"Error writing summary CSV: {e}")
-    
-    def _write_csv_report(self, filename: str, data: List[Tuple[str, str]], 
-                         description: str, headers: List[str]) -> None:
-        """Helper method to write CSV reports with error handling."""
-        try:
-            with open(filename, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(headers)
-                writer.writerows(data)
-            logging.info(f"Saved {len(data)} unique {description} to {filename}")
-        except Exception as e:
-            logging.error(f"Error writing {filename}: {e}")
-    
+
     def run_experiments(self) -> List[NavigationResult]:
         """Run all experiments based on configuration."""
         all_results = []
@@ -857,15 +790,15 @@ class WikiNavigator:
         iterations = self.config['iterations_per_start_page']
         
         total_experiments = len(temperatures) * len(start_pages) * len(personalities) * iterations
-        self._console_print("\n" + "="*70)
-        self._console_print(f"🚀 STARTING EXPERIMENTS")
-        self._console_print(f"   Backend: {self.config['backend'].upper()}")
-        self._console_print(f"   Total runs: {total_experiments}")
-        self._console_print(f"   Start pages: {', '.join(start_pages)}")
-        self._console_print(f"   Target: {self.config['target']}")
-        self._console_print(f"   Temperatures: {temperatures}")
-        self._console_print(f"   Personalities: {personalities}")
-        self._console_print("="*70 + "\n")
+        print("\n" + "="*70)
+        print(f"STARTING EXPERIMENTS")
+        print(f"  Backend: {self.config['backend'].upper()}")
+        print(f"  Total runs: {total_experiments}")
+        print(f"  Start pages: {', '.join(start_pages)}")
+        print(f"  Target: {self.config['target']}")
+        print(f"  Temperatures: {temperatures}")
+        print(f"  Personalities: {personalities}")
+        print("="*70 + "\n")
 
         experiment_num = 0
         success_count = 0
@@ -874,19 +807,17 @@ class WikiNavigator:
         for temp in temperatures:
             for start_page in start_pages:
                 for personality in personalities:
-                    for i in tqdm(range(iterations), 
-                                desc=f"{start_page[:20]} (T={temp}, P={personality[:4]})",
-                                leave=False):
+                    for i in range(iterations):
                         experiment_num += 1
                         
-                        self._console_print(f"\n[{experiment_num}/{total_experiments}] {start_page} → {self.config['target']} | T={temp} | P={personality}")
+                        print(f"\n[{experiment_num}/{total_experiments}] {start_page} -> {self.config['target']} | T={temp} | P={personality} (Run {i+1}/{iterations})")
                         
                         random.seed(f"{start_page}_{temp}_{personality}_{i}")
                         
                         result = self.run_navigation_experiment(
-                            start_page, 
-                            self.config['target'], 
-                            temp, 
+                            start_page,
+                            self.config['target'],
+                            temp,
                             personality
                         )
                         
@@ -906,15 +837,15 @@ class WikiNavigator:
         self.save_summary_csv(all_results)
 
         avg_steps = sum(total_steps) / len(total_steps) if total_steps else 0
-        self._console_print("\n" + "="*70)
-        self._console_print("📈 EXPERIMENT SUMMARY")
-        self._console_print("="*70)
-        self._console_print(f"Backend: {self.config['backend'].upper()}")
-        self._console_print(f"Total runs: {len(all_results)}")
-        self._console_print(f"Success rate: {success_count/len(all_results)*100:.1f}% ({success_count}/{len(all_results)})")
-        self._console_print(f"Avg steps (successful): {avg_steps:.1f}")
-        self._console_print(f"Results saved in: {self.config['output_dir']}")
-        self._console_print("="*70 + "\n")
+        print("\n" + "="*70)
+        print("EXPERIMENT SUMMARY")
+        print("="*70)
+        print(f"Backend: {self.config['backend'].upper()}")
+        print(f"Total runs: {len(all_results)}")
+        print(f"Success rate: {success_count/len(all_results)*100:.1f}% ({success_count}/{len(all_results)})")
+        print(f"Avg steps (successful): {avg_steps:.1f}")
+        print(f"Results saved in: {self.config['output_dir']}")
+        print("="*70 + "\n")
 
         logging.info(f"Completed {len(all_results)} iterations. Individual results saved in: {self.config['output_dir']}")
         return all_results
