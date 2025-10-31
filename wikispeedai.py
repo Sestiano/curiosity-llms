@@ -17,6 +17,12 @@ from pathlib import Path
 from enum import Enum
 
 
+class LLMBackend(Enum):
+    """Enumeration of supported LLM backends."""
+    LM_STUDIO = "lm_studio"
+    OLLAMA = "ollama"
+
+
 class Personality(Enum):
     """Enumeration of available personality types for navigation."""
     BASELINE = "baseline"
@@ -82,7 +88,8 @@ class NavigationResult:
     target: str
     model: str
     personality: str
-    lm_studio_url: str
+    backend: str
+    backend_url: str
     total_pages_visited: int
     loop_detected: bool
     error_type: Optional[str]
@@ -108,6 +115,7 @@ class WikiNavigator:
         
         self._setup_logging()
         
+        logging.info(f"Using backend: {self.config['backend']}")
         logging.info(f"Using model: {self.config['model_name']}")
         logging.info(f"Output directory: {self.config['output_dir']}")
     
@@ -129,7 +137,6 @@ class WikiNavigator:
         console_handler.setFormatter(simple_formatter)
 
         logger = logging.getLogger()
-        # Clear existing handlers to avoid duplication if the class is re-instantiated
         if logger.hasHandlers():
             logger.handlers.clear()
 
@@ -160,6 +167,29 @@ class WikiNavigator:
             logging.warning("Using default 'lm_studio' as model name")
             return 'lm_studio'
     
+    def _get_ollama_model_name(self, ollama_url: str, timeout: int = 120) -> str:
+        """Retrieve the current model name from Ollama API."""
+        try:
+            # Get the base URL (remove /api/chat or /api/generate)
+            base_url = ollama_url.rsplit('/api/', 1)[0]
+            tags_url = f"{base_url}/api/tags"
+            
+            response = requests.get(tags_url, timeout=timeout)
+            response.raise_for_status()
+            result = response.json()
+            
+            if 'models' in result and len(result['models']) > 0:
+                model_name = result['models'][0].get('name', 'ollama')
+                logging.info(f"Auto-detected Ollama model: {model_name}")
+                return model_name
+            else:
+                logging.warning("No model found in Ollama response, using default 'ollama'")
+                return 'ollama'
+        except Exception as e:
+            logging.error(f"Could not retrieve model name from Ollama: {e}")
+            logging.warning("Using default 'ollama' as model name")
+            return 'ollama'
+    
     def _load_config(self, config_file: str) -> Dict:
         """Load and validate configuration from config.json."""
         config_path = Path(config_file)
@@ -169,14 +199,30 @@ class WikiNavigator:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
 
-        if 'model_name' not in config or not config['model_name']:
-            logging.info("Model name not specified in config, auto-detecting from LM Studio...")
-            config['model_name'] = self._get_lm_studio_model_name(
-                config.get('lm_studio_url', "http://localhost:1234/v1/chat/completions"),
-                timeout=config.get('model_detection_timeout', 120)
-            )
-        else:
-            logging.info(f"Using model name from config: {config['model_name']}")
+        # Determine backend
+        backend = config.get('backend', 'lm_studio').lower()
+        if backend not in ['lm_studio', 'ollama']:
+            logging.warning(f"Invalid backend '{backend}', defaulting to 'lm_studio'")
+            backend = 'lm_studio'
+        config['backend'] = backend
+
+        # Set appropriate URL based on backend
+        if backend == 'lm_studio':
+            config['backend_url'] = config.get('lm_studio_url', "http://localhost:1234/v1/chat/completions")
+            if 'model_name' not in config or not config['model_name']:
+                logging.info("Model name not specified, auto-detecting from LM Studio...")
+                config['model_name'] = self._get_lm_studio_model_name(
+                    config['backend_url'],
+                    timeout=config.get('model_detection_timeout', 120)
+                )
+        else:  # ollama
+            config['backend_url'] = config.get('ollama_url', "http://localhost:11434/api/chat")
+            if 'model_name' not in config or not config['model_name']:
+                logging.info("Model name not specified, auto-detecting from Ollama...")
+                config['model_name'] = self._get_ollama_model_name(
+                    config['backend_url'],
+                    timeout=config.get('model_detection_timeout', 120)
+                )
         
         model_name = config['model_name']
         config['output_dir'] = model_name.replace('/', '_').replace(':', '_').replace('\\', '_')
@@ -244,7 +290,14 @@ class WikiNavigator:
             links_list=links_list
         )
 
-    def call_lm_studio(self, messages: List[Dict], temperature: float = 0.3) -> Optional[str]:
+    def call_llm(self, messages: List[Dict], temperature: float = 0.3) -> Optional[str]:
+        """Call LLM API (LM Studio or Ollama based on configuration)."""
+        if self.config['backend'] == 'lm_studio':
+            return self._call_lm_studio(messages, temperature)
+        else:
+            return self._call_ollama(messages, temperature)
+
+    def _call_lm_studio(self, messages: List[Dict], temperature: float = 0.3) -> Optional[str]:
         """Call LM Studio API."""
         payload = {
             "model": self.config.get('model_name', 'local-model'),
@@ -255,7 +308,7 @@ class WikiNavigator:
         }
         try:
             response = requests.post(
-                self.config['lm_studio_url'], 
+                self.config['backend_url'], 
                 json=payload, 
                 timeout=self.config.get('api_timeout', 1200)
             )
@@ -264,6 +317,31 @@ class WikiNavigator:
             return result['choices'][0]['message']['content'].strip()
         except requests.exceptions.RequestException as e:
             logging.error(f"Error calling LM Studio: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logging.error(f"Response content: {e.response.text}")
+            return None
+
+    def _call_ollama(self, messages: List[Dict], temperature: float = 0.3) -> Optional[str]:
+        """Call Ollama API."""
+        payload = {
+            "model": self.config.get('model_name', 'llama2'),
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": temperature
+            }
+        }
+        try:
+            response = requests.post(
+                self.config['backend_url'],
+                json=payload,
+                timeout=self.config.get('api_timeout', 1200)
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result['message']['content'].strip()
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error calling Ollama: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 logging.error(f"Response content: {e.response.text}")
             return None
@@ -308,7 +386,6 @@ class WikiNavigator:
 
     def _get_cached_page_html(self, page) -> str:
         """Loads page HTML from cache or fetches and saves it."""
-        # Sanitize title to create a valid filename
         safe_title = "".join(c for c in page.title if c.isalnum() or c in (' ', '_')).rstrip()
         cache_file = self.cache_dir / f"{safe_title}.html"
 
@@ -435,7 +512,7 @@ class WikiNavigator:
                 logging.info("Disambiguation found. Asking LLM to choose.")
                 options = result
                 prompt = self.create_disambiguation_prompt(temp_current, options, target_article, path)
-                response = self.call_lm_studio([{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}], temperature)
+                response = self.call_llm([{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}], temperature)
                 
                 chosen_option, _ = self.parse_model_choice(response, options)
                 
@@ -461,7 +538,7 @@ class WikiNavigator:
         for attempt in range(max_attempts):
             prompt = self.create_navigation_prompt(page_title, target_article, available_anchors, path, page_content) if attempt == 0 else self.create_correction_prompt(metadata.get("raw_choice"), target_article, available_anchors, path)
             
-            response = self.call_lm_studio([{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}], temperature)
+            response = self.call_llm([{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}], temperature)
             if not response:
                 return None, {}, "api_call_failed"
             
@@ -493,7 +570,6 @@ class WikiNavigator:
             stats.avg_similarity_score = sum(sim_scores) / len(sim_scores)
 
         if success:
-            # In a successful run, all fallbacks that occurred are considered "successful" because they led to the target
             stats.successful_fallback_steps = stats.steps_with_fallback
             if stats.total_fallbacks > 0:
                 stats.fallback_success_rate = (len(stats.successful_fallback_steps) / stats.total_fallbacks) * 100
@@ -523,14 +599,12 @@ class WikiNavigator:
                 self._console_print(f"  🎯 TARGET REACHED in {step} steps! ({elapsed:.1f}s)")
                 break
             
-            # --- 1. LOAD PAGE ---
             page, error_type = self._handle_page_loading(current, target_article, path, system_prompt, temperature, max_correction_attempts)
             if error_type:
                 self._console_print(f"  ❌ ERROR: {error_type}")
                 break
             current = page.title
 
-            # --- 2. EXTRACT LINKS ---
             all_links, page_content = self.get_page_links(page)
             available_links_map = {anchor: title for anchor, title in all_links if title.lower() not in visited}
             
@@ -544,13 +618,11 @@ class WikiNavigator:
             
             available_anchors = list(available_links_map.keys())
             
-            # --- 3. GET LLM CHOICE ---
             chosen_anchor, metadata, error_type = self._get_llm_choice(
                 page.title, page_content, target_article, path, 
                 available_anchors, system_prompt, temperature, max_correction_attempts
             )
             
-            # --- 4. PROCESS RESULT (Live feedback) ---
             if metadata.get("fallback_used"):
                 if metadata["match_type"] == "fuzzy_match": 
                     self._console_print(f"  ⚠️  Step {step}: {current} → {available_links_map.get(chosen_anchor, '?')} (fuzzy: {metadata['similarity_score']:.2f})")
@@ -561,7 +633,6 @@ class WikiNavigator:
                 self._console_print(f"  ❌ ERROR: {error_type}")
                 break
                 
-            # --- 5. LOOP DETECTION & STATE UPDATE ---
             chosen_title = available_links_map[chosen_anchor]
 
             self.all_chosen_links_set.add((current, chosen_title))
@@ -597,11 +668,9 @@ class WikiNavigator:
             visited.add(current.lower())
             step += 1
 
-        # --- 6. FINAL STATISTICS CALCULATION ---
         elapsed_time = (datetime.now() - start_time).total_seconds()
         fallback_stats = self._calculate_final_statistics(detailed_steps, success)
 
-        # Print summary
         if success:
             self._console_print(f"  ✅ SUCCESS in {step} steps | Fallbacks: {fallback_stats.total_fallbacks} ({fallback_stats.fallback_rate:.1f}%) | Time: {elapsed_time:.1f}s")
         else:
@@ -617,7 +686,8 @@ class WikiNavigator:
             target=target_article,
             model=self.config.get('model_name', 'unknown'),
             personality=personality,
-            lm_studio_url=self.config['lm_studio_url'],
+            backend=self.config['backend'],
+            backend_url=self.config['backend_url'],
             total_pages_visited=len(visited),
             loop_detected=loop_detected,
             error_type=error_type
@@ -630,11 +700,9 @@ class WikiNavigator:
         output_dir = Path(self.config['output_dir']) / f"temp_{temp_str}_personality_{personality}" / start_page.replace(' ', '_')
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # --- Create and save the detailed CSV with all possible links ---
         detailed_csv_filename = output_dir / f"result_{iteration+1:03d}_possible_links.csv"
         self.save_detailed_links_csv(result.detailed_steps, detailed_csv_filename)
 
-        # --- Prepare the main JSON result, removing the large link maps ---
         result_dict = asdict(result)
         for step in result_dict.get('detailed_steps', []):
             if 'available_links_map' in step:
@@ -685,7 +753,7 @@ class WikiNavigator:
         
         headers = [
             "iteration_in_group", "success", "steps", "start", "target", 
-            "temperature", "personality", "total_pages_visited", 
+            "temperature", "personality", "backend", "total_pages_visited", 
             "loop_detected", "error_type", "total_fallbacks", 
             "fallback_rate", "total_hallucinations", "avg_similarity_score",
             "path"
@@ -704,6 +772,7 @@ class WikiNavigator:
                         "target": result.target,
                         "temperature": result.temperature,
                         "personality": result.personality,
+                        "backend": result.backend,
                         "total_pages_visited": result.total_pages_visited,
                         "loop_detected": result.loop_detected,
                         "error_type": result.error_type,
@@ -742,6 +811,7 @@ class WikiNavigator:
         total_experiments = len(temperatures) * len(start_pages) * len(personalities) * iterations
         self._console_print("\n" + "="*70)
         self._console_print(f"🚀 STARTING EXPERIMENTS")
+        self._console_print(f"   Backend: {self.config['backend'].upper()}")
         self._console_print(f"   Total runs: {total_experiments}")
         self._console_print(f"   Start pages: {', '.join(start_pages)}")
         self._console_print(f"   Target: {self.config['target']}")
@@ -791,6 +861,7 @@ class WikiNavigator:
         self._console_print("\n" + "="*70)
         self._console_print("📈 EXPERIMENT SUMMARY")
         self._console_print("="*70)
+        self._console_print(f"Backend: {self.config['backend'].upper()}")
         self._console_print(f"Total runs: {len(all_results)}")
         self._console_print(f"Success rate: {success_count/len(all_results)*100:.1f}% ({success_count}/{len(all_results)})")
         self._console_print(f"Avg steps (successful): {avg_steps:.1f}")

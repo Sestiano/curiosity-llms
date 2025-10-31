@@ -1,9 +1,9 @@
 {
+  "backend": "lm_studio",
   "start_pages": [
-    "Albert Einstein",
-    "Computer Science"
+    "Peanut"
   ],
-  "target": "Cloud computing",
+  "target": "Jupiter",
   "iterations_per_start_page": 10,
   "temperatures": [
     0.3
@@ -14,13 +14,14 @@
     "hunter",
     "dancer"
   ],
+  "ollama_url": "http://localhost:8080/api/chat",
   "lm_studio_url": "http://localhost:1234/v1/chat/completions",
-  "model_name": "",
+  "model_name": "qwen/qwen3-4b-thinking-2507",
   "fuzzy_match_threshold": 0.95,
   "max_loop_repetitions": 3,
-  "max_correction_attempts": 1,
-  "api_timeout": 1200,
-  "model_detection_timeout": 120,
+  "max_correction_attempts": 2,
+  "api_timeout": 12000,
+  "model_detection_timeout": 1200,
   "personality_traits": {
     "baseline": "",
     "busybody": "You MUST have a BUSYBODY type personality.\nYou like to explore many different things without going to deep.\nYou move quickly from one idea to another, following what feels new or interesting.\nYour knowledge is wide and varied, often about culture and geography.\nKeep these elements in mind now that you act as a BUSYBODY type of personality.",
@@ -29,8 +30,9 @@
   },
   "prompts": {
     "baseline": "You are a Large Language Model acting as a Wikipedia navigator.\nYour goal is to reach the TARGET article by selecting every time a link.\n\nRules:\n- Read the \"CURRENT PAGE CONTENT\" to understand the topic and available connections\n- Choose ONE link that brings you towards the target's webpage\n- You MUST reply in JSON format with TWO fields:\n  * \"link\": the EXACT LINK name from the available options\n  * \"reason\": a BRIEF explanation of why you chose this link",
-    "navigation": "Your TARGET page of Wikipedia is: \"{target_article}\"\nYour CURRENT page of Wikipedia is: \"{current_article}\"\nYour PREVIOUS PAGE was: {recent_path}\n\nSelect the link by reading the CURRENT PAGE: {content_text}\n\nAVAILABLE LINKS: {links_list}\n\nTASK: Choose ONE link that brings you towards the target's webpage: \"{target_article}\"\nRemember to respond in JSON format with both \"link\" and \"reason\" fields.",
+    "navigation": "Your TARGET page of Wikipedia is: \"{target_article}\"\nYour CURRENT page of Wikipedia is: \"{current_article}\"\nYour PREVIOUS PAGE was: {recent_path}\n\nSelect the link by reading the CURRENT PAGE: {content_text}\n\nAVAILABLE LINKS: {links_list}\n\nTASK: Choose ONE link that brings you towards the target's webpage: \"{target_article}\"\nRemember to respond in JSON format with both \"link\" and \"reason\" fields. \nKeep in mind that the current page may not contain a direct link to the target page; your goal is to select the link that you believe navigates closest to the target.\n You must remain strictly focused on the task objective and must not address or interact with the user/operator in any way.",
     "disambiguation": "Your previous choice \"{original_choice}\" was AMBIGUOUS.\nYour PREVIOUS PAGE was: {recent_path}\n\nTo continue, you must choose ONE link that brings you towards the target's webpage: \"{target_article}\".\nAVAILABLE OPTIONS:\n{options_list}\n\nTASK: Choose the BEST option from the list to reach the target. Respond in JSON format with both \"link\" and \"reason\" fields.",
     "correction": "CORRECTION REQUIRED: Your previous choice \"{invalid_choice}\" was INVALID because it is NOT in the list of available links.\n\nYour TARGET is : \"{target_article}\"\nYour PREVIOUS PAGE was: {recent_path}\n\nPlease review the AVAILABLE LINKS carefully. You must choose one of these available links: {links_list}\n\nTASK: Choose a VALID link from the list. Respond in JSON."
-  }
+  },
+  "content_mode": "summary"
 }
