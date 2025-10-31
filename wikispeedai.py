@@ -113,6 +113,10 @@ class WikiNavigator:
         self.cache_dir = Path(__file__).parent / "wiki_cache"
         self.cache_dir.mkdir(exist_ok=True)
         
+        # Cache directory for full content (renamed from summaries)
+        self.content_cache_dir = Path(__file__).parent / "wiki_content"
+        self.content_cache_dir.mkdir(exist_ok=True)
+        
         self._setup_logging()
         
         logging.info(f"Using backend: {self.config['backend']}")
@@ -322,14 +326,18 @@ class WikiNavigator:
             return None
 
     def _call_ollama(self, messages: List[Dict], temperature: float = 0.3) -> Optional[str]:
-        """Call Ollama API."""
+        """Call Ollama API with improved configuration."""
         payload = {
             "model": self.config.get('model_name', 'llama2'),
             "messages": messages,
             "stream": False,
             "options": {
-                "temperature": temperature
-            }
+                "temperature": temperature,
+                "num_predict": 1024,  # Max tokens for response
+                "top_p": 0.9,
+                "top_k": 40,
+            },
+            "format": "json"  # Force JSON output for Ollama
         }
         try:
             response = requests.post(
@@ -339,7 +347,17 @@ class WikiNavigator:
             )
             response.raise_for_status()
             result = response.json()
-            return result['message']['content'].strip()
+            
+            # Debug logging for Ollama
+            logging.info(f"Ollama response keys: {result.keys()}")
+            if 'message' not in result:
+                logging.error(f"Unexpected Ollama response format: {result}")
+                return None
+                
+            content = result['message']['content'].strip()
+            logging.info(f"Ollama raw response: {content[:200]}...")
+            return content
+            
         except requests.exceptions.RequestException as e:
             logging.error(f"Error calling Ollama: {e}")
             if hasattr(e, 'response') and e.response is not None:
@@ -355,6 +373,12 @@ class WikiNavigator:
             traits = self.config.get('personality_traits', {}).get('baseline', '')
 
         baseline_prompt = self.config['prompts']['baseline']
+        
+        # Add extra clarity for Ollama
+        if self.config['backend'] == 'ollama':
+            json_instruction = '\n\nIMPORTANT: You MUST respond with valid JSON only. Format: {"link": "exact_link_text", "reason": "brief explanation"}'
+            return f"{baseline_prompt}\n{traits}{json_instruction}" if traits else f"{baseline_prompt}{json_instruction}"
+        
         return f"{baseline_prompt}\n{traits}" if traits else baseline_prompt
     
     def get_wikipedia_page(self, title: str) -> Tuple[str, any]:
@@ -384,17 +408,37 @@ class WikiNavigator:
             logging.error(f"Unexpected error while loading '{title}': {e}")
             return 'error', str(e)
 
+    def _get_cached_page_content(self, page) -> str:
+        """Loads full page content from cache or fetches and saves it."""
+        safe_title = "".join(c for c in page.title if c.isalnum() or c in (' ', '_')).rstrip()
+        cache_file = self.content_cache_dir / f"{safe_title}.txt"
+
+        if cache_file.exists():
+            logging.info(f"CONTENT CACHE HIT: Loading '{page.title}' content from cache.")
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                return f.read()
+        else:
+            logging.info(f"CONTENT CACHE MISS: Fetching '{page.title}' content and caching.")
+            try:
+                content = page.content  # Full content instead of summary
+                with open(cache_file, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                return content
+            except Exception as e:
+                logging.error(f"Could not fetch or cache content for '{page.title}': {e}")
+                return ""
+
     def _get_cached_page_html(self, page) -> str:
         """Loads page HTML from cache or fetches and saves it."""
         safe_title = "".join(c for c in page.title if c.isalnum() or c in (' ', '_')).rstrip()
         cache_file = self.cache_dir / f"{safe_title}.html"
 
         if cache_file.exists():
-            logging.info(f"CACHE HIT: Loading '{page.title}' from cache.")
+            logging.info(f"HTML CACHE HIT: Loading '{page.title}' from cache.")
             with open(cache_file, 'r', encoding='utf-8') as f:
                 return f.read()
         else:
-            logging.info(f"CACHE MISS: Fetching '{page.title}' from Wikipedia and caching.")
+            logging.info(f"HTML CACHE MISS: Fetching '{page.title}' from Wikipedia and caching.")
             try:
                 html_content = page.html()
                 with open(cache_file, 'w', encoding='utf-8') as f:
@@ -405,7 +449,7 @@ class WikiNavigator:
                 return ""
     
     def get_page_links(self, page, exclude_keywords: Optional[List[str]] = None) -> Tuple[List[Tuple[str, str]], str]:
-        """Fetches a Wikipedia page HTML from cache or web and extracts internal links and text content."""
+        """Fetches a Wikipedia page HTML from cache or web and extracts internal links and full text content."""
         if not page:
             return [], ""
 
@@ -415,18 +459,22 @@ class WikiNavigator:
         ]
         
         try:
+            # Get both HTML and full content
             html_content = self._get_cached_page_html(page)
+            full_content = self._get_cached_page_content(page)
+            
             if not html_content:
-                return [], ""
+                return [], full_content
 
             soup = BeautifulSoup(html_content, 'html.parser')
             content = soup.find('div', {'id': 'mw-content-text'}) or soup.find('div', {'class': 'mw-parser-output'})
             
             if not content:
                 logging.warning(f"Could not find the main content area for page '{page.title}'.")
-                return [], ""
+                return [], full_content
 
-            page_text = content.get_text(strip=True, separator=' ')
+            # Use full content from page.content
+            page_text = full_content
 
             seen_anchors, links = set(), []
             for a in content.find_all('a', href=True):
