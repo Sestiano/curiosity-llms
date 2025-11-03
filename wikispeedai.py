@@ -237,7 +237,7 @@ ws ::= [ \\t\\n]*''')
                     corrections_used += 1
                     logging.info(f"Correction attempt {attempt}")
                 
-                output = self.llm(prompt, max_tokens=150, grammar=grammar)
+                output = self.llm(prompt, max_tokens=2048, grammar=grammar)
                 chosen, reason = self.parse_response(output['choices'][0]['text'].strip())
                 
                 if chosen in available:
@@ -283,7 +283,7 @@ ws ::= [ \\t\\n]*''')
             if status == 'disambiguation':
                 logging.info(f"Resolving disambiguation for: {chosen}")
                 prompt = self.create_disambiguation_prompt(chosen, target, path, result)
-                output = self.llm(prompt, max_tokens=150, grammar=self.create_grammar(result))
+                output = self.llm(prompt, max_tokens=2048, grammar=self.create_grammar(result))
                 chosen, _ = self.parse_response(output['choices'][0]['text'].strip())
                 logging.info(f"Disambiguation resolved to: {chosen}")
                 status, result = self.get_wikipedia_page(chosen)
