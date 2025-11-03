@@ -147,10 +147,10 @@ class WikiNavigator:
         escaped_links = [link.replace('\\', '\\\\').replace('"', '\\"') for link in links]
         alternatives = ' | '.join([f'"{link}"' for link in escaped_links])
         return LlamaGrammar.from_string(f'''root ::= object
-object ::= "{{" ws members ws "}}"
-members ::= pair (ws "," ws pair)*
-pair ::= "\\"link\\"" ws ":" ws string ws "," ws "\\"reason\\"" ws ":" ws string
-string ::= "\\"" ({alternatives}) "\\""
+object ::= "{{" ws "\\"link\\"" ws ":" ws link-value ws "," ws "\\"reason\\"" ws ":" ws reason-value ws "}}"
+link-value ::= "\\"" ({alternatives}) "\\""
+reason-value ::= "\\"" reason-text "\\""
+reason-text ::= [^"]*
 ws ::= [ \\t\\n]*''')
     
     def get_personality_prompt(self, personality):
