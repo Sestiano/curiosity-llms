@@ -62,8 +62,13 @@ class WikiNavigator:
     def _init_llm(self):
         if self.llm is None:
             model_path = os.path.join(os.path.dirname(__file__), self.config['model_path'])
+            n_gpu = self.config.get('n_gpu_layers', -1)
+            n_ctx = self.config.get('n_ctx', 8192)  # Default to 8192 if not specified
             logging.info(f"Loading model: {model_path}")
-            self.llm = Llama(model_path=model_path, n_ctx=2048, n_gpu_layers=0, verbose=False)
+            logging.info(f"GPU layers: {n_gpu} (-1 = all layers on GPU, 0 = CPU only)")
+            logging.info(f"Context window: {n_ctx} tokens")
+            # Set verbose=False to reduce console output from llama.cpp
+            self.llm = Llama(model_path=model_path, n_ctx=n_ctx, n_gpu_layers=n_gpu, verbose=False)
             logging.info("Model loaded successfully")
     
     def _cache_path(self, page_title):
@@ -138,7 +143,9 @@ class WikiNavigator:
         return links, content
     
     def create_grammar(self, links):
-        alternatives = ' | '.join([f'"{link}"' for link in links])
+        # Escape double quotes and backslashes in link titles for grammar
+        escaped_links = [link.replace('\\', '\\\\').replace('"', '\\"') for link in links]
+        alternatives = ' | '.join([f'"{link}"' for link in escaped_links])
         return LlamaGrammar.from_string(f'''root ::= object
 object ::= "{{" ws members ws "}}"
 members ::= pair (ws "," ws pair)*
@@ -237,7 +244,7 @@ ws ::= [ \\t\\n]*''')
                     logging.info(f"Valid link chosen: {chosen}")
                     break
                 else:
-                    logging.warning(f"Invalid link chosen: {chosen}")
+                    logging.warning(f"Invalid link chosen: '{chosen}' - reason: '{reason}' (not found in available links: {len(available)} options)")
             
             if chosen not in available:
                 logging.error(f"Failed to find valid link after {self.config['max_correction_attempts']} attempts")
@@ -301,6 +308,15 @@ ws ::= [ \\t\\n]*''')
         output_dir = Path(self.config['output_dir']) / f"personality_{personality}" / start_page.replace(' ', '_')
         output_dir.mkdir(parents=True, exist_ok=True)
         
+        # Save available links CSV BEFORE removing available_links_map
+        with open(output_dir / f"result_{iteration:03d}_available_links.csv", 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['step', 'origin_page', 'link_text', 'destination_page'])
+            for step_data in result['detailed_steps']:
+                for link, dest in step_data.get('available_links_map', {}).items():
+                    writer.writerow([step_data['step'], step_data['from'], link, dest])
+        
+        # Create a copy and remove available_links_map for JSON
         result_copy = result.copy()
         for step in result_copy.get('detailed_steps', []):
             if 'available_links_map' in step:
@@ -312,15 +328,8 @@ ws ::= [ \\t\\n]*''')
         with open(output_dir / f"result_{iteration:03d}_steps.csv", 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=['step', 'from', 'to', 'reason', 'available_links', 'corrections'])
             writer.writeheader()
-            for step in result['detailed_steps']:
+            for step in result_copy['detailed_steps']:
                 writer.writerow({k: v for k, v in step.items() if k != 'available_links_map'})
-        
-        with open(output_dir / f"result_{iteration:03d}_available_links.csv", 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['step', 'origin_page', 'link_text', 'destination_page'])
-            for step_data in result['detailed_steps']:
-                for link, dest in step_data.get('available_links_map', {}).items():
-                    writer.writerow([step_data['step'], step_data['from'], link, dest])
         
         logging.info(f"Saved result {iteration} for {start_page}/{personality}")
     
