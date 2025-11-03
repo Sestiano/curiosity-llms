@@ -49,5 +49,7 @@ wheels/
 .DS_Store
 Thumbs.db
 
-# models directory
+# Directories
 models/
+wiki_cache/
+logs/
