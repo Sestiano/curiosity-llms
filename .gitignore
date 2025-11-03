@@ -17,6 +17,7 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
 ENV/
 build/
 develop-eggs/
@@ -48,5 +49,5 @@ wheels/
 .DS_Store
 Thumbs.db
 
-# config.json
-config.json
+# models directory
+models/

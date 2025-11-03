@@ -1,856 +1,430 @@
-import wikipedia
-import requests
-import json
-from datetime import datetime
-import warnings
+from llama_cpp import Llama, LlamaGrammar
 import os
-import sys
-from bs4 import BeautifulSoup
-from difflib import SequenceMatcher
-import random
-from urllib.parse import unquote
+import wikipedia
+import json
 import csv
 import logging
-from typing import Dict, List, Tuple, Optional, Set, Callable, Any
-from dataclasses import dataclass, field, asdict
+from bs4 import BeautifulSoup
+from urllib.parse import unquote
 from pathlib import Path
-from enum import Enum
-
-
-class LLMBackend(Enum):
-    """Enumeration of supported LLM backends."""
-    LM_STUDIO = "lm_studio"
-    OLLAMA = "ollama"
-
-
-class Personality(Enum):
-    """Enumeration of available personality types for navigation."""
-    BASELINE = "baseline"
-    BUSYBODY = "busybody"
-    HUNTER = "hunter"
-    DANCER = "dancer"
-
-
-@dataclass
-class NavigationStep:
-    """Represents a single step in the navigation path."""
-    step_number: int
-    origin_page: str
-    destination_page: str
-    reason: str
-    available_links_count: int
-    total_visited: int
-    fallback_used: bool = False
-    match_type: str = "unknown"
-    similarity_score: float = 0.0
-    correction_attempts: int = 0
-    available_links_map: Dict[str, str] = field(default_factory=dict)
-
-
-@dataclass
-class FallbackStatistics:
-    """Statistics about fallback mechanisms used during navigation."""
-    total_fallbacks: int = 0
-    fuzzy_match_fallbacks: int = 0
-    total_hallucinations: int = 0
-    fallback_rate: float = 0.0
-    avg_similarity_score: float = 0.0
-    steps_with_fallback: List[int] = field(default_factory=list)
-    successful_fallback_steps: List[int] = field(default_factory=list)
-    fallback_success_rate: float = 0.0
-
-
-@dataclass
-class NavigationResult:
-    """Complete result of a navigation experiment."""
-    success: bool
-    steps: int
-    path: List[str]
-    detailed_steps: List[NavigationStep]
-    fallback_statistics: FallbackStatistics
-    start: str
-    target: str
-    model: str
-    personality: str
-    backend: str
-    backend_url: str
-    total_pages_visited: int
-    loop_detected: bool
-    error_type: Optional[str]
-    config_start_page: str = ""
-    temperature: float = 0.3
-    iteration_in_group: int = 0
-
+from datetime import datetime
 
 class WikiNavigator:
-    """Wikipedia navigation experiment using LLM with different personalities and temperatures."""
-
-    def __init__(self, config_file: str = 'config.json'):
-        """Initialize the WikiNavigator with configuration."""
+    def __init__(self, config_file='config.json'):
         wikipedia.set_lang('en')
-        warnings.filterwarnings('ignore')
-
         self.config = self._load_config(config_file)
-        self.all_available_links_set: Set[Tuple[str, str]] = set()
-        self.all_chosen_links_set: Set[Tuple[str, str]] = set()
-
-        base_dir = Path(__file__).parent
-        self.cache_dir = base_dir / "wiki_cache"
-        self.content_cache_dir = base_dir / "wiki_content"
+        self.cache_dir = Path("wiki_cache")
         self.cache_dir.mkdir(exist_ok=True)
-        self.content_cache_dir.mkdir(exist_ok=True)
-
+        self.llm = None
+        self.all_edges = []
         self._setup_logging()
-
-        logging.info(f"Using backend: {self.config['backend']}")
-        logging.info(f"Using model: {self.config['model_name']}")
-        logging.info(f"Output directory: {self.config['output_dir']}")
-
-    def _setup_logging(self) -> None:
-        """Configure logging with file and console handlers."""
-        log_dir = Path(__file__).parent / "logs"
-        log_dir.mkdir(exist_ok=True)
-        log_filename = log_dir / f"experiment_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-
-        detailed_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        simple_formatter = logging.Formatter('%(message)s')
-
-        file_handler = logging.FileHandler(log_filename)
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(detailed_formatter)
-
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(logging.WARNING)
-        console_handler.setFormatter(simple_formatter)
-
-        logger = logging.getLogger()
-        if logger.hasHandlers():
-            logger.handlers.clear()
-
-        logger.setLevel(logging.INFO)
-        logger.addHandler(file_handler)
-        logger.addHandler(console_handler)
-
-    def _get_model_name_from_api(self, url: str, method: str) -> str:
-        """Helper to retrieve model name from LM Studio or Ollama."""
-        try:
-            response = requests.get(url, timeout=self.config.get('model_detection_timeout', 120))
-            response.raise_for_status()
-            result = response.json()
-            
-            if method == 'lm_studio':
-                if 'data' in result and len(result['data']) > 0:
-                    return result['data'][0].get('id', 'lm_studio')
-            elif method == 'ollama':
-                if 'models' in result and len(result['models']) > 0:
-                    return result['models'][0].get('name', 'ollama')
-                    
-            logging.warning(f"No model found in {method} response, using default '{method}'")
-            return method
-        except Exception as e:
-            logging.error(f"Could not retrieve model name from {method}: {e}")
-            logging.warning(f"Using default '{method}' as model name")
-            return method
-
-    def _get_lm_studio_model_name(self, lm_studio_url: str) -> str:
-        """Retrieve the current model name from LM Studio API."""
-        models_url = lm_studio_url.replace('/v1/chat/completions', '/v1/models')
-        return self._get_model_name_from_api(models_url, 'lm_studio')
-
-    def _get_ollama_model_name(self, ollama_url: str) -> str:
-        """Retrieve the current model name from Ollama API."""
-        base_url = ollama_url.rsplit('/api/', 1)[0]
-        tags_url = f"{base_url}/api/tags"
-        return self._get_model_name_from_api(tags_url, 'ollama')
-
-    def _load_config(self, config_file: str) -> Dict:
-        """Load and validate configuration from config.json."""
-        config_path = Path(config_file)
-        if not config_path.exists():
-            raise FileNotFoundError(f"Configuration file not found: {config_file}")
-
-        with open(config_path, 'r', encoding='utf-8') as f:
+        
+    def _load_config(self, config_file):
+        if not Path(config_file).exists():
+            return {
+                "model_path": "models/mistral-7b-instruct-v0.2.Q4_K_M.gguf",
+                "start_pages": ["Peanut"],
+                "target": "Jupiter",
+                "iterations_per_start_page": 5,
+                "personalities": ["baseline"],
+                "max_correction_attempts": 2,
+                "max_loop_repetitions": 3,
+                "output_dir": "results",
+                "prompts": {},
+                "personality_traits": {}
+            }
+        
+        with open(config_file, 'r') as f:
             config = json.load(f)
-
-        backend_info = {
-            'lm_studio': {
-                'url_key': 'lm_studio_url',
-                'default_url': 'http://localhost:1234/v1/chat/completions',
-                'detector': self._get_lm_studio_model_name
-            },
-            'ollama': {
-                'url_key': 'ollama_url',
-                'default_url': 'http://localhost:11434/api/chat',
-                'detector': self._get_ollama_model_name
-            }
-        }
-
-        backend = config.get('backend', 'lm_studio').lower()
-        if backend not in backend_info:
-            logging.warning(f"Invalid backend '{backend}', defaulting to 'lm_studio'")
-            backend = 'lm_studio'
-        config['backend'] = backend
-
-        info = backend_info[backend]
-        config['backend_url'] = config.get(info['url_key'], info['default_url'])
-
-        if 'model_name' not in config or not config['model_name']:
-            logging.info(f"Model name not specified, auto-detecting from {backend}...")
-            config['model_name'] = info['detector'](config['backend_url'])
-
-        model_name = config['model_name']
-        config['output_dir'] = model_name.replace('/', '_').replace(':', '_').replace('\\', '_')
-
-        sp = config.get('start_pages', ['Vaccine'])
-        config['start_pages'] = [sp] if isinstance(sp, str) else sp
-        t = config.get('temperatures', [0.3])
-        config['temperatures'] = [t] if isinstance(t, (int, float)) else t
-
-        valid_personalities = [p.value for p in Personality]
-        config['personalities'] = [p for p in config.get('personalities', ['baseline']) if p in valid_personalities]
-        if not config['personalities']:
-            logging.warning("No valid personalities found in config, using baseline")
-            config['personalities'] = [Personality.BASELINE.value]
-
+        
+        config.setdefault("model_path", "models/mistral-7b-instruct-v0.2.Q4_K_M.gguf")
+        config.setdefault("max_correction_attempts", 2)
+        config.setdefault("max_loop_repetitions", 3)
+        config.setdefault("output_dir", "results")
+        config.setdefault("personalities", ["baseline"])
         return config
-
-    def create_navigation_prompt(self, current_article: str, target_article: str,
-                                 links: List[str], path: List[str],
-                                 page_content: Optional[str] = None) -> str:
-        """Create a prompt for the LLM with current context and available links"""
-        recent_path = ' '.join(path[:-1]) if len(path) > 1 else path[0]
-        links_list = '\n'.join(links)
-        content_text = page_content if page_content else "[no content available]"
+    
+    def _setup_logging(self):
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+        log_file = log_dir / f"experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         
-        prompt_template = self.config['prompts']['navigation']
-        return prompt_template.format(
-            target_article=target_article,
-            current_article=current_article,
-            recent_path=recent_path,
-            content_text=content_text,
-            links_list=links_list
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler()
+            ]
         )
-
-    def create_disambiguation_prompt(self, original_choice: str, options: List[str],
-                                     target_article: str, path: List[str]) -> str:
-        """Create a prompt for the LLM to resolve a disambiguation page."""
-        recent_path = ' '.join(path[:-1]) if len(path) > 1 else path[0]
-        shuffled_options = options.copy()
-        random.shuffle(shuffled_options)
-        options_list = '\n'.join(shuffled_options)
-
-        prompt_template = self.config['prompts']['disambiguation']
-        return prompt_template.format(
-            original_choice=original_choice,
-            recent_path=recent_path,
-            target_article=target_article,
-            options_list=options_list
-        )
-
-    def create_correction_prompt(self, invalid_choice: str, target_article: str,
-                                 links: List[str], path: List[str]) -> str:
-        """Create a prompt for the LLM to correct an invalid link selection."""
-        recent_path = ' '.join(path[:-1]) if len(path) > 1 else path[0]
-        shuffled_links = links.copy()
-        random.shuffle(shuffled_links)
-        links_list = '\n'.join(shuffled_links)
-
-        prompt_template = self.config['prompts']['correction']
-        return prompt_template.format(
-            invalid_choice=invalid_choice,
-            target_article=target_article,
-            recent_path=recent_path,
-            links_list=links_list
-        )
-
-    def call_llm(self, messages: List[Dict], temperature: float = 0.3) -> Optional[str]:
-        """Call LLM API (LM Studio or Ollama based on configuration)."""
-        backend = self.config['backend']
-        url = self.config['backend_url']
-        model = self.config.get('model_name', 'local-model')
-        timeout = self.config.get('api_timeout', 1200)
-        payload = {}
-        
-        if backend == 'lm_studio':
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": -1,
-                "stream": False
-            }
-        elif backend == 'ollama':
-            payload = {
-                "model": model,
-                "messages": messages,
-                "stream": False,
-                "options": {
-                    "temperature": temperature,
-                },
-                "format": "json"
-            }
-        
-        try:
-            response = requests.post(url, json=payload, timeout=timeout)
-            response.raise_for_status()
-            result = response.json()
-
-            if backend == 'lm_studio':
-                return result['choices'][0]['message']['content'].strip()
-            elif backend == 'ollama':
-                content = result.get('message', {}).get('content', '').strip()
-                logging.info(f"Ollama raw response: {content[:200]}...")
-                return content
-                
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Error calling {backend} at {url}: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                logging.error(f"Response content: {e.response.text}")
-        
+        logging.getLogger().handlers[1].setLevel(logging.WARNING)
+    
+    def _init_llm(self):
+        if self.llm is None:
+            model_path = os.path.join(os.path.dirname(__file__), self.config['model_path'])
+            logging.info(f"Loading model: {model_path}")
+            self.llm = Llama(model_path=model_path, n_ctx=2048, n_gpu_layers=0, verbose=False)
+            logging.info("Model loaded successfully")
+    
+    def _cache_path(self, page_title):
+        safe_title = "".join(c for c in page_title if c.isalnum() or c in (' ', '_')).rstrip()
+        return self.cache_dir / f"{safe_title}.txt"
+    
+    def _get_cached_content(self, page_title):
+        cache_file = self._cache_path(page_title)
+        if cache_file.exists():
+            logging.info(f"Cache hit: {page_title}")
+            return cache_file.read_text(encoding='utf-8')
+        logging.info(f"Cache miss: {page_title}")
         return None
-
-    def get_personality_prompt(self, personality: str = "baseline") -> str:
-        """Get the combined system prompt for a given personality."""
-        traits = self.config.get('personality_traits', {}).get(personality)
-
-        if traits is None:
-            logging.warning(f"Invalid or missing personality '{personality}', using baseline")
-            traits = self.config.get('personality_traits', {}).get('baseline', '')
-
-        baseline_prompt = self.config['prompts']['baseline']
-        
-        json_instruction = ''
-        if self.config['backend'] == 'ollama':
-            json_instruction = '\n\nIMPORTANT: You MUST respond with valid JSON only. Format: {"link": "exact_link_text", "reason": "brief explanation"}'
-        
-        full_prompt = f"{baseline_prompt}\n{traits}" if traits else baseline_prompt
-        return f"{full_prompt}{json_instruction}"
-
-    def get_wikipedia_page(self, title: str) -> Tuple[str, Any]:
-        """Loads a Wikipedia page with error handling."""
+    
+    def _save_cached_content(self, page_title, content):
+        self._cache_path(page_title).write_text(content, encoding='utf-8')
+        logging.info(f"Cached content for: {page_title}")
+    
+    def get_wikipedia_page(self, title):
         try:
             page = wikipedia.page(title, auto_suggest=False, redirect=True)
+            logging.info(f"Loaded page: {page.title}")
             return 'success', page
         except wikipedia.exceptions.DisambiguationError as e:
-            logging.info(f"'{title}' is a disambiguation page. Returning options.")
+            logging.info(f"Disambiguation page: {title}")
             return 'disambiguation', e.options
         except wikipedia.exceptions.PageError:
-            logging.info(f"Page '{title}' not found. Trying with auto-suggest...")
+            logging.warning(f"Page not found: {title}, trying auto-suggest")
             try:
                 page = wikipedia.page(title, auto_suggest=True, redirect=True)
-                logging.info(f"Found alternative page: '{page.title}'")
+                logging.info(f"Found alternative: {page.title}")
                 return 'success', page
-            except wikipedia.exceptions.DisambiguationError as e:
-                logging.warning(f"Suggestion for '{title}' also led to a disambiguation.")
-                return 'disambiguation', e.options
-            except wikipedia.exceptions.PageError:
-                logging.error(f"No page found for '{title}', even with suggestions.")
+            except:
+                logging.error(f"No page found for: {title}")
                 return 'not_found', None
-            except Exception as e:
-                logging.error(f"Unexpected error during auto-suggest for '{title}': {e}")
-                return 'error', str(e)
         except Exception as e:
-            logging.error(f"Unexpected error while loading '{title}': {e}")
+            logging.error(f"Error loading page {title}: {e}")
             return 'error', str(e)
-
-    def _get_cached_resource(self, page_title: str, cache_dir: Path,
-                             file_ext: str, fetch_callable: Callable[[], str]) -> str:
-        """Generic helper to cache and retrieve a page resource (HTML or content)."""
-        safe_title = "".join(c for c in page_title if c.isalnum() or c in (' ', '_')).rstrip()
-        cache_file = cache_dir / f"{safe_title}.{file_ext}"
-
-        if cache_file.exists():
-            logging.info(f"{file_ext.upper()} CACHE HIT: Loading '{page_title}' from cache.")
-            with open(cache_file, 'r', encoding='utf-8') as f:
-                return f.read()
-        else:
-            logging.info(f"{file_ext.upper()} CACHE MISS: Fetching '{page_title}' and caching.")
-            try:
-                content = fetch_callable()
-                with open(cache_file, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                return content
-            except Exception as e:
-                logging.error(f"Could not fetch or cache {file_ext} for '{page_title}': {e}")
-                return ""
-
-    def _get_cached_page_content(self, page: Any) -> str:
-        """Loads full page content from cache or fetches and saves it."""
-        return self._get_cached_resource(page.title, self.content_cache_dir, "txt", lambda: page.content)
-
-    def _get_cached_page_html(self, page: Any) -> str:
-        """Loads page HTML from cache or fetches and saves it."""
-        return self._get_cached_resource(page.title, self.cache_dir, "html", lambda: page.html())
-
-    def get_page_links(self, page: Any, exclude_keywords: Optional[List[str]] = None) -> Tuple[List[Tuple[str, str]], str]:
-        """Fetches a Wikipedia page HTML from cache or web and extracts internal links and full text content."""
-        if not page:
+    
+    def get_page_links(self, page_title):
+        status, result = self.get_wikipedia_page(page_title)
+        if status != 'success':
             return [], ""
-
-        exclude = exclude_keywords or [
-            'Category:', 'Template:', 'File:', 'Portal:', 'Help:', 'Wikipedia:',
-            'Talk:', 'Special:', 'Template talk:'
-        ]
         
-        try:
-            html_content = self._get_cached_page_html(page)
-            full_content = self._get_cached_page_content(page)
+        page = result
+        content = self._get_cached_content(page.title) or page.content
+        if content == page.content:
+            self._save_cached_content(page.title, content)
+        
+        soup = BeautifulSoup(page.html(), 'html.parser')
+        content_div = soup.find('div', {'id': 'mw-content-text'}) or soup.find('div', {'class': 'mw-parser-output'})
+        if not content_div:
+            return [], content
+        
+        exclude = ['Category:', 'Template:', 'File:', 'Portal:', 'Help:', 'Wikipedia:', 'Talk:', 'Special:', 'Template talk:']
+        seen, links = set(), []
+        
+        for a in content_div.find_all('a', href=True):
+            href = a.get('href', '')
+            if not href.startswith('/wiki/'):
+                continue
             
-            if not html_content:
-                return [], full_content
-
-            soup = BeautifulSoup(html_content, 'html.parser')
-            content_div = soup.find('div', {'id': 'mw-content-text'}) or soup.find('div', {'class': 'mw-parser-output'})
+            title = unquote(href.replace('/wiki/', '')).replace('_', ' ')
+            if '#' in title or any(kw in title for kw in exclude):
+                continue
             
-            if not content_div:
-                logging.warning(f"Could not find the main content area for page '{page.title}'.")
-                return [], full_content
-
-            seen_anchors, links = set(), []
-            for a in content_div.find_all('a', href=True):
-                href = a.get('href', '')
-                
-                if href.startswith('/wiki/'):
-                    page_title = unquote(href.replace('/wiki/', '')).replace('_', ' ')
-
-                    if '#' not in page_title and not any(kw in page_title for kw in exclude):
-                        anchor_text = a.get_text(strip=True)
-                        
-                        if anchor_text and not (anchor_text.startswith('[') and anchor_text.endswith(']')) and anchor_text not in seen_anchors:
-                            seen_anchors.add(anchor_text)
-                            links.append((anchor_text, page_title))
-            return links, full_content
-            
-        except Exception as e:
-            logging.error(f"An error occurred while parsing HTML for links in page '{page.title}': {e}")
-            return [], ""
-
-    @staticmethod
-    def fuzzy_similarity(s1: str, s2: str) -> float:
-        """Calculate fuzzy similarity between two strings."""
-        return SequenceMatcher(None, s1.lower(), s2.lower()).ratio()
-
-    def parse_model_choice(self, response: Optional[str],
-                             available_links: List[str]) -> Tuple[Optional[str], Dict]:
-        """Parse the model's response and match it to an available link."""
-        if not response:
-            return None, {}
+            text = a.get_text(strip=True)
+            if text and not (text.startswith('[') and text.endswith(']')) and text not in seen:
+                seen.add(text)
+                links.append(text)
         
-        metadata = {"fallback_used": False, "match_type": "unknown", "similarity_score": 0.0, "reason": "", "raw_choice": ""}
-        
-        try:
-            response_data = json.loads(response.strip())
-            chosen_text = response_data.get("link", "").strip()
-            metadata["reason"] = response_data.get("reason", "").strip()
-        except json.JSONDecodeError:
-            logging.warning(f"JSON parsing failed, treating response as plain text link.")
-            chosen_text = response.strip().strip('"\',:;!?()[]{}')
-            metadata["reason"] = "No reason provided (non-JSON response)"
-        
-        metadata["raw_choice"] = chosen_text
-        if not chosen_text:
-            return None, metadata
-
-        for link in available_links:
-            if link.lower() == chosen_text.lower():
-                metadata.update({"match_type": "exact_match", "similarity_score": 1.0})
-                return link, metadata
-
-        threshold = self.config.get('fuzzy_match_threshold', 0.95)
-        best_link, best_score = max(
-            ((link, self.fuzzy_similarity(chosen_text, link)) for link in available_links),
-            key=lambda item: item[1],
-            default=(None, 0.0)
+        return links, content
+    
+    def create_grammar(self, links):
+        alternatives = ' | '.join([f'"{link}"' for link in links])
+        return LlamaGrammar.from_string(f'''root ::= object
+object ::= "{{" ws members ws "}}"
+members ::= pair (ws "," ws pair)*
+pair ::= "\\"link\\"" ws ":" ws string ws "," ws "\\"reason\\"" ws ":" ws string
+string ::= "\\"" ({alternatives}) "\\""
+ws ::= [ \\t\\n]*''')
+    
+    def get_personality_prompt(self, personality):
+        baseline = self.config.get('prompts', {}).get('baseline', '')
+        traits = self.config.get('personality_traits', {}).get(personality, '')
+        return f"{baseline}\n{traits}" if traits else baseline
+    
+    def _format_prompt(self, template, **kwargs):
+        return template.format(**kwargs) if template else ""
+    
+    def create_navigation_prompt(self, current, target, path, content, links):
+        return self._format_prompt(
+            self.config.get('prompts', {}).get('navigation', ''),
+            target_article=target,
+            current_article=current,
+            recent_path=' -> '.join(path[-3:]) if len(path) > 1 else current,
+            content_text=content[:1000] if content else "[no content]",
+            links_list='\n'.join(links)
         )
+    
+    def create_disambiguation_prompt(self, choice, target, path, options):
+        return self._format_prompt(
+            self.config.get('prompts', {}).get('disambiguation', ''),
+            original_choice=choice,
+            recent_path=' -> '.join(path[-3:]) if len(path) > 1 else path[0],
+            target_article=target,
+            options_list='\n'.join(options)
+        )
+    
+    def create_correction_prompt(self, invalid_choice, target, path, links):
+        return self._format_prompt(
+            self.config.get('prompts', {}).get('correction', ''),
+            invalid_choice=invalid_choice,
+            target_article=target,
+            recent_path=' -> '.join(path[-3:]) if len(path) > 1 else path[0],
+            links_list='\n'.join(links)
+        )
+    
+    def parse_response(self, response):
+        try:
+            data = json.loads(response.strip())
+            return data.get('link', '').strip(), data.get('reason', '').strip()
+        except:
+            return response.strip().strip('"'), "No reason provided"
+    
+    def navigate(self, start, target, personality='baseline'):
+        self._init_llm()
         
-        if best_score >= threshold:
-            metadata.update({"fallback_used": True, "match_type": "fuzzy_match", "similarity_score": best_score})
-            logging.info(f"FALLBACK: Fuzzy match ({best_score:.2f}) - '{chosen_text}' -> '{best_link}'")
-            return best_link, metadata
-
-        metadata.update({"fallback_used": True, "match_type": "no_match_hallucination", "similarity_score": best_score})
-        logging.warning(f"HALLUCINATION: No match for '{chosen_text}' (best: {best_score:.2f})")
-        return None, metadata
-
-    def _handle_page_loading(self, current_page_title: str, target_article: str,
-                             path: List[str], system_prompt: str,
-                             temperature: float, max_attempts: int) -> Tuple[Any, Optional[str]]:
-        """Handles page loading, including disambiguation resolution."""
-        page, status = None, ''
-        temp_current = current_page_title
-
-        for _ in range(max_attempts):
-            status, result = self.get_wikipedia_page(temp_current)
-            
-            if status == 'success':
-                page = result
-                break
-            
-            elif status == 'disambiguation':
-                logging.info("Disambiguation found. Asking LLM to choose.")
-                options = result
-                prompt = self.create_disambiguation_prompt(temp_current, options, target_article, path)
-                response = self.call_llm([{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}], temperature)
-                
-                chosen_option, _ = self.parse_model_choice(response, options)
-                
-                if chosen_option:
-                    temp_current = chosen_option
-                else:
-                    logging.error("LLM failed to resolve disambiguation. Halting.")
-                    return None, "disambiguation_resolution_failed"
-            else:
-                return None, f"page_load_failed_{status}"
-                
-        if not page or status != 'success':
-            return None, "page_load_unknown_error"
-            
-        return page, None
-
-    def _get_llm_choice(self, page_title: str, page_content: str, target_article: str, path: List[str],
-                        available_anchors: List[str], system_prompt: str,
-                        temperature: float, max_attempts: int) -> Tuple[Optional[str], Dict, Optional[str]]:
-        """Handles LLM choice, including self-correction loop."""
-        chosen_anchor, metadata = None, {}
-        
-        for attempt in range(max_attempts):
-            if attempt == 0:
-                prompt = self.create_navigation_prompt(page_title, target_article, available_anchors, path, page_content)
-            else:
-                prompt = self.create_correction_prompt(metadata.get("raw_choice"), target_article, available_anchors, path)
-            
-            response = self.call_llm([{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}], temperature)
-            if not response:
-                return None, {}, "api_call_failed"
-            
-            chosen_anchor, metadata = self.parse_model_choice(response, available_anchors)
-            metadata["correction_attempts"] = attempt
-            
-            if chosen_anchor:
-                return chosen_anchor, metadata, None
-                
-        logging.warning("LLM failed to provide a valid link after retries. Halting.")
-        return None, metadata, "hallucination_max_retries_exceeded"
-
-    def _calculate_final_statistics(self, detailed_steps: List[NavigationStep], success: bool) -> FallbackStatistics:
-        """Calculate fallback and other statistics from the detailed steps of a run."""
-        stats = FallbackStatistics()
-        total_steps = len(detailed_steps)
-        if total_steps == 0:
-            return stats
-
-        stats.steps_with_fallback = [s.step_number for s in detailed_steps if s.fallback_used]
-        stats.total_fallbacks = len(stats.steps_with_fallback)
-        stats.fuzzy_match_fallbacks = sum(1 for s in detailed_steps if s.match_type == "fuzzy_match")
-        stats.total_hallucinations = sum(1 for s in detailed_steps if s.match_type == "no_match_hallucination")
-        
-        stats.fallback_rate = (stats.total_fallbacks / total_steps) * 100 if total_steps > 0 else 0
-
-        sim_scores = [s.similarity_score for s in detailed_steps if s.match_type == "fuzzy_match"]
-        if sim_scores:
-            stats.avg_similarity_score = sum(sim_scores) / len(sim_scores)
-
-        if success:
-            stats.successful_fallback_steps = stats.steps_with_fallback
-            if stats.total_fallbacks > 0:
-                stats.fallback_success_rate = (len(stats.successful_fallback_steps) / stats.total_fallbacks) * 100
-        
-        return stats
-
-    def run_navigation_experiment(self, start_article: str, target_article: str,
-                                  temperature: float = 0.3,
-                                  personality: str = "baseline") -> NavigationResult:
-        """Run a single navigation experiment."""
-        start_time = datetime.now()
-        
-        current, path, visited = start_article, [start_article], {start_article.lower()}
-        success, detailed_steps, loop_detected = False, [], False
-        error_type = None
-
-        max_loop_repetitions = self.config.get('max_loop_repetitions', 3)
-        max_correction_attempts = self.config.get('max_correction_attempts', 2)
+        current, path, visited = start, [start], {start.lower()}
+        detailed_steps, corrections_used = [], 0
         recent_transitions = []
+        max_loop = self.config['max_loop_repetitions']
+        
+        start_time = datetime.now()
+        logging.info(f"Starting navigation: {start} -> {target} (personality: {personality})")
+        
         system_prompt = self.get_personality_prompt(personality)
         
         step = 0
-        while step < 50:
-            if current.lower() == target_article.lower():
-                success = True
-                elapsed = (datetime.now() - start_time).total_seconds()
-                print(f"  TARGET REACHED in {step} steps! ({elapsed:.1f}s)")
-                break
+        while current.lower() != target.lower():
+            logging.info(f"Step {step}: Current page = {current}")
             
-            page, error_type = self._handle_page_loading(current, target_article, path, system_prompt, temperature, max_correction_attempts)
-            if error_type:
-                print(f"  ERROR: {error_type}")
-                break
-            current = page.title
-
-            all_links, page_content = self.get_page_links(page)
-            available_links_map = {anchor: title for anchor, title in all_links if title.lower() not in visited}
+            links, content = self.get_page_links(current)
+            available = [link for link in links if link.lower() not in visited]
             
-            self.all_available_links_set.update([(current, title) for anchor, title in available_links_map.items()])
-
-            if not available_links_map:
-                logging.warning("Dead end reached.")
-                error_type = "dead_end_no_links"
-                print(f"  DEAD END at '{current}'")
-                break
+            if not available:
+                logging.warning(f"Dead end reached at: {current}")
+                return {
+                    'success': False, 'steps': step, 'path': path, 'detailed_steps': detailed_steps,
+                    'start': start, 'target': target, 'personality': personality,
+                    'error_type': 'dead_end', 'time': (datetime.now() - start_time).total_seconds(),
+                    'corrections_used': corrections_used, 'loop_detected': False
+                }
             
-            available_anchors = list(available_links_map.keys())
+            logging.info(f"Available links: {len(available)}")
+            grammar = self.create_grammar(available)
+            chosen, reason = None, ""
             
-            chosen_anchor, metadata, error_type = self._get_llm_choice(
-                page.title, page_content, target_article, path,
-                available_anchors, system_prompt, temperature, max_correction_attempts
-            )
-            
-            if metadata.get("fallback_used"):
-                if metadata["match_type"] == "fuzzy_match":
-                    print(f"  Step {step}: {current} -> {available_links_map.get(chosen_anchor, '?')} (fuzzy: {metadata['similarity_score']:.2f})")
-                elif metadata["match_type"] == "no_match_hallucination":
-                    print(f"  Step {step}: Hallucination detected")
-            
-            if error_type:
-                print(f"  ERROR: {error_type}")
-                break
+            for attempt in range(self.config['max_correction_attempts']):
+                prompt = self.create_navigation_prompt(current, target, path, content, available) if attempt == 0 \
+                         else self.create_correction_prompt(chosen, target, path, available)
                 
-            chosen_title = available_links_map[chosen_anchor]
-
-            self.all_chosen_links_set.add((current, chosen_title))
-
-            transition = (current.lower(), chosen_title.lower())
+                if attempt > 0:
+                    corrections_used += 1
+                    logging.info(f"Correction attempt {attempt}")
+                
+                output = self.llm(prompt, max_tokens=150, grammar=grammar)
+                chosen, reason = self.parse_response(output['choices'][0]['text'].strip())
+                
+                if chosen in available:
+                    logging.info(f"Valid link chosen: {chosen}")
+                    break
+                else:
+                    logging.warning(f"Invalid link chosen: {chosen}")
+            
+            if chosen not in available:
+                logging.error(f"Failed to find valid link after {self.config['max_correction_attempts']} attempts")
+                return {
+                    'success': False, 'steps': step, 'path': path, 'detailed_steps': detailed_steps,
+                    'start': start, 'target': target, 'personality': personality,
+                    'error_type': 'invalid_link', 'time': (datetime.now() - start_time).total_seconds(),
+                    'corrections_used': corrections_used, 'loop_detected': False
+                }
+            
+            available_links_map = {link: link for link in available}
+            
+            detailed_steps.append({
+                'step': step, 'from': current, 'to': chosen, 'reason': reason,
+                'available_links': len(available), 'corrections': attempt,
+                'available_links_map': available_links_map
+            })
+            
+            self.all_edges.append((current, chosen))
+            
+            transition = (current.lower(), chosen.lower())
             recent_transitions.append(transition)
-            if len(recent_transitions) > max_loop_repetitions * 2:
+            if len(recent_transitions) > max_loop * 2:
                 recent_transitions.pop(0)
             
-            if recent_transitions.count(transition) >= max_loop_repetitions:
-                loop_detected = True
-                error_type = "loop_detected"
-                logging.warning(f"LOOP DETECTED: Transition '{current}' -> '{chosen_title}' repeated.")
-                print(f"  LOOP DETECTED: {current} <-> {chosen_title}")
-                break
-                
-            detailed_steps.append(NavigationStep(
-                step_number=step,
-                origin_page=current,
-                destination_page=chosen_title,
-                reason=metadata.get("reason", ""),
-                available_links_count=len(available_anchors),
-                total_visited=len(visited),
-                fallback_used=metadata.get("fallback_used", False),
-                match_type=metadata.get("match_type", "unknown"),
-                similarity_score=metadata.get("similarity_score", 0.0),
-                correction_attempts=metadata.get("correction_attempts", 0),
-                available_links_map=available_links_map
-            ))
+            if recent_transitions.count(transition) >= max_loop:
+                logging.warning(f"Loop detected: {current} <-> {chosen} (repeated {max_loop} times)")
+                return {
+                    'success': False, 'steps': step, 'path': path, 'detailed_steps': detailed_steps,
+                    'start': start, 'target': target, 'personality': personality,
+                    'error_type': 'loop_detected', 'time': (datetime.now() - start_time).total_seconds(),
+                    'corrections_used': corrections_used, 'loop_detected': True
+                }
             
-            current = chosen_title
+            status, result = self.get_wikipedia_page(chosen)
+            if status == 'disambiguation':
+                logging.info(f"Resolving disambiguation for: {chosen}")
+                prompt = self.create_disambiguation_prompt(chosen, target, path, result)
+                output = self.llm(prompt, max_tokens=150, grammar=self.create_grammar(result))
+                chosen, _ = self.parse_response(output['choices'][0]['text'].strip())
+                logging.info(f"Disambiguation resolved to: {chosen}")
+                status, result = self.get_wikipedia_page(chosen)
+            
+            current = result.title if status == 'success' else chosen
             path.append(current)
             visited.add(current.lower())
             step += 1
-
-        elapsed_time = (datetime.now() - start_time).total_seconds()
-        fallback_stats = self._calculate_final_statistics(detailed_steps, success)
-
-        if success:
-            print(f"  SUCCESS in {step} steps | Fallbacks: {fallback_stats.total_fallbacks} ({fallback_stats.fallback_rate:.1f}%) | Time: {elapsed_time:.1f}s")
-        else:
-            print(f"  FAILED: {error_type} after {step} steps | Time: {elapsed_time:.1f}s")
-
-        return NavigationResult(
-            success=success,
-            steps=len(path) - 1,
-            path=path,
-            detailed_steps=detailed_steps,
-            fallback_statistics=fallback_stats,
-            start=start_article,
-            target=target_article,
-            model=self.config.get('model_name', 'unknown'),
-            personality=personality,
-            backend=self.config['backend'],
-            backend_url=self.config['backend_url'],
-            total_pages_visited=len(visited),
-            loop_detected=loop_detected,
-            error_type=error_type
-        )
-
-    def save_individual_result(self, result: NavigationResult, start_page: str,
-                               temp: float, personality: str, iteration: int) -> None:
-        """Saves a single experiment result to a structured directory."""
-        temp_str = str(temp).replace('.', '_')
-        output_dir = Path(self.config['output_dir']) / f"temp_{temp_str}_personality_{personality}" / start_page.replace(' ', '_')
+        
+        elapsed = (datetime.now() - start_time).total_seconds()
+        logging.info(f"SUCCESS! Reached target in {step} steps ({elapsed:.1f}s)")
+        print(f"  SUCCESS in {step} steps ({elapsed:.1f}s)")
+        
+        return {
+            'success': True, 'steps': step, 'path': path, 'detailed_steps': detailed_steps,
+            'start': start, 'target': target, 'personality': personality,
+            'error_type': None, 'time': elapsed, 'corrections_used': corrections_used,
+            'loop_detected': False
+        }
+    
+    def save_result(self, result, start_page, personality, iteration):
+        output_dir = Path(self.config['output_dir']) / f"personality_{personality}" / start_page.replace(' ', '_')
         output_dir.mkdir(parents=True, exist_ok=True)
-
-        detailed_csv_filename = output_dir / f"result_{iteration+1:03d}_possible_links.csv"
-        self.save_detailed_links_csv(result.detailed_steps, detailed_csv_filename)
-
-        result_dict = asdict(result)
-        for step_data in result_dict.get('detailed_steps', []):
-            if 'available_links_map' in step_data:
-                del step_data['available_links_map']
-
-        filename = output_dir / f"result_{iteration+1:03d}.json"
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(result_dict, f, indent=2, ensure_ascii=False)
-
-    def save_detailed_links_csv(self, detailed_steps: List[NavigationStep], filename: Path) -> None:
-        """Saves the available links from each step to a detailed CSV file."""
-        try:
-            with open(filename, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(['step_number', 'origin_page', 'anchor_text', 'destination_page_title'])
-                for step in detailed_steps:
-                    for anchor, title in step.available_links_map.items():
-                        writer.writerow([step.step_number, step.origin_page, anchor, title])
-        except Exception as e:
-            logging.error(f"Error writing detailed links CSV {filename}: {e}")
-
-    def _write_csv_report(self, filename: str, data: List[Tuple[str, str]],
-                          description: str, headers: List[str]) -> None:
-        """Helper method to write CSV reports with error handling."""
-        try:
-            with open(filename, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(headers)
-                writer.writerows(data)
-            logging.info(f"Saved {len(data)} unique {description} to {filename}")
-        except Exception as e:
-            logging.error(f"Error writing {filename}: {e}")
-
-    def save_csv_reports(self) -> None:
-        """Write summary CSV files for available and chosen links."""
-        logging.info("\nWriting summary CSV files...")
         
-        self._write_csv_report(
-            'network_possible_edges.csv',
-            sorted(list(self.all_available_links_set)),
-            "possible navigation edges",
-            ['source_page', 'destination_page']
-        )
+        result_copy = result.copy()
+        for step in result_copy.get('detailed_steps', []):
+            if 'available_links_map' in step:
+                del step['available_links_map']
         
-        self._write_csv_report(
-            'network_explored_edges.csv',
-            sorted(list(self.all_chosen_links_set)),
-            "explored navigation edges",
-            ['source_page', 'destination_page']
-        )
-
-    def save_summary_csv(self, all_results: List[NavigationResult]) -> None:
-        """Saves a summary of all experiment runs to a single CSV file."""
-        if not all_results:
-            logging.warning("No results to save to summary CSV.")
-            return
-
-        output_dir = Path(self.config['output_dir'])
-        summary_filename = output_dir / "experiment_summary.csv"
+        with open(output_dir / f"result_{iteration:03d}.json", 'w', encoding='utf-8') as f:
+            json.dump(result_copy, f, indent=2, ensure_ascii=False)
         
-        headers = [
-            "iteration_in_group", "success", "steps", "start", "target",
-            "temperature", "personality", "backend", "total_pages_visited",
-            "loop_detected", "error_type", "total_fallbacks",
-            "fallback_rate", "total_hallucinations", "avg_similarity_score",
-            "path"
-        ]
-
-        try:
-            with open(summary_filename, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=headers)
-                writer.writeheader()
-                for result in all_results:
-                    row = {
-                        "iteration_in_group": result.iteration_in_group,
-                        "success": result.success,
-                        "steps": result.steps,
-                        "start": result.start,
-                        "target": result.target,
-                        "temperature": result.temperature,
-                        "personality": result.personality,
-                        "backend": result.backend,
-                        "total_pages_visited": result.total_pages_visited,
-                        "loop_detected": result.loop_detected,
-                        "error_type": result.error_type,
-                        "total_fallbacks": result.fallback_statistics.total_fallbacks,
-                        "fallback_rate": f"{result.fallback_statistics.fallback_rate:.2f}%",
-                        "total_hallucinations": result.fallback_statistics.total_hallucinations,
-                        "avg_similarity_score": f"{result.fallback_statistics.avg_similarity_score:.2f}",
-                        "path": " -> ".join(result.path)
-                    }
-                    writer.writerow(row)
-            logging.info(f"Summary of all experiments saved to {summary_filename}")
-            print(f"Summary CSV saved to: {summary_filename}")
-        except Exception as e:
-            logging.error(f"Error writing summary CSV: {e}")
-
-    def run_experiments(self) -> List[NavigationResult]:
-        """Run all experiments based on configuration."""
-        all_results = []
+        with open(output_dir / f"result_{iteration:03d}_steps.csv", 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['step', 'from', 'to', 'reason', 'available_links', 'corrections'])
+            writer.writeheader()
+            for step in result['detailed_steps']:
+                writer.writerow({k: v for k, v in step.items() if k != 'available_links_map'})
+        
+        with open(output_dir / f"result_{iteration:03d}_available_links.csv", 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['step', 'origin_page', 'link_text', 'destination_page'])
+            for step_data in result['detailed_steps']:
+                for link, dest in step_data.get('available_links_map', {}).items():
+                    writer.writerow([step_data['step'], step_data['from'], link, dest])
+        
+        logging.info(f"Saved result {iteration} for {start_page}/{personality}")
+    
+    def save_edges_csv(self):
+        filename = Path(self.config['output_dir']) / "network_edges.csv"
+        with open(filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['source', 'target'])
+            writer.writerows(sorted(set(self.all_edges)))
+        logging.info(f"Saved {len(set(self.all_edges))} unique edges to {filename}")
+        print(f"Saved {len(set(self.all_edges))} unique edges to {filename}")
+    
+    def save_summary(self, results):
+        filename = Path(self.config['output_dir']) / "summary.csv"
+        
+        with open(filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                'iteration', 'start', 'target', 'personality', 'success', 'steps', 
+                'error_type', 'time', 'corrections_used', 'loop_detected', 'path'
+            ])
+            writer.writeheader()
+            
+            for i, r in enumerate(results, 1):
+                writer.writerow({
+                    'iteration': i, 'start': r['start'], 'target': r['target'],
+                    'personality': r['personality'], 'success': r['success'], 'steps': r['steps'],
+                    'error_type': r.get('error_type', ''), 'time': f"{r['time']:.1f}",
+                    'corrections_used': r.get('corrections_used', 0), 
+                    'loop_detected': r.get('loop_detected', False),
+                    'path': ' -> '.join(r['path'])
+                })
+        
+        logging.info(f"Summary saved to {filename}")
+        print(f"Summary saved to {filename}")
+        
+        stats = {}
+        for r in results:
+            p = r['personality']
+            if p not in stats:
+                stats[p] = {'total': 0, 'success': 0, 'steps': [], 'loops': 0, 'corrections': 0}
+            
+            stats[p]['total'] += 1
+            stats[p]['corrections'] += r.get('corrections_used', 0)
+            if r['success']:
+                stats[p]['success'] += 1
+                stats[p]['steps'].append(r['steps'])
+            if r.get('loop_detected'):
+                stats[p]['loops'] += 1
+        
+        print("\nStatistics by Personality:")
+        for p in sorted(stats.keys()):
+            s = stats[p]
+            rate = s['success'] / s['total'] * 100 if s['total'] > 0 else 0
+            avg = sum(s['steps']) / len(s['steps']) if s['steps'] else 0
+            avg_corr = s['corrections'] / s['total'] if s['total'] > 0 else 0
+            print(f"  {p}: {s['success']}/{s['total']} ({rate:.1f}%) - Avg steps: {avg:.1f} - Loops: {s['loops']} - Avg corrections: {avg_corr:.1f}")
+            logging.info(f"Stats {p}: {s['success']}/{s['total']} ({rate:.1f}%) - Avg: {avg:.1f} - Loops: {s['loops']}")
+    
+    def run_experiments(self):
+        start_pages = self.config.get('start_pages', ['Vaccine'])
+        target = self.config['target']
+        iterations = self.config.get('iterations_per_start_page', 5)
         personalities = self.config.get('personalities', ['baseline'])
-        start_pages = self.config['start_pages']
-        temperatures = self.config['temperatures']
-        iterations = self.config['iterations_per_start_page']
         
-        total_experiments = len(temperatures) * len(start_pages) * len(personalities) * iterations
-        print("\n" + "="*70)
-        print(f"STARTING EXPERIMENTS")
-        print(f"  Backend: {self.config['backend'].upper()}")
-        print(f"  Total runs: {total_experiments}")
-        print(f"  Start pages: {', '.join(start_pages)}")
-        print(f"  Target: {self.config['target']}")
-        print(f"  Temperatures: {temperatures}")
-        print(f"  Personalities: {personalities}")
-        print("="*70 + "\n")
-
-        experiment_num = 0
+        total = len(start_pages) * len(personalities) * iterations
+        logging.info(f"Starting {total} experiments")
+        logging.info(f"Start pages: {start_pages}")
+        logging.info(f"Target: {target}")
+        logging.info(f"Personalities: {personalities}")
+        
+        print(f"\nStarting {total} experiments")
+        print(f"Start pages: {', '.join(start_pages)}")
+        print(f"Target: {target}")
+        print(f"Personalities: {', '.join(personalities)}\n")
+        
+        all_results = []
         success_count = 0
-        total_steps = []
         
-        for temp in temperatures:
-            for start_page in start_pages:
-                for personality in personalities:
-                    for i in range(iterations):
-                        experiment_num += 1
-                        
-                        print(f"\n[{experiment_num}/{total_experiments}] {start_page} -> {self.config['target']} | T={temp} | P={personality} (Run {i+1}/{iterations})")
-                        
-                        random.seed(f"{start_page}_{temp}_{personality}_{i}")
-                        
-                        result = self.run_navigation_experiment(
-                            start_page,
-                            self.config['target'],
-                            temp,
-                            personality
-                        )
-                        
-                        result.config_start_page = start_page
-                        result.temperature = temp
-                        result.iteration_in_group = i + 1
-                        
-                        all_results.append(result)
-                        
-                        if result.success:
-                            success_count += 1
-                            total_steps.append(result.steps)
-
-                        self.save_individual_result(result, start_page, temp, personality, i)
-
-        self.save_csv_reports()
-        self.save_summary_csv(all_results)
-
-        avg_steps = sum(total_steps) / len(total_steps) if total_steps else 0
-        print("\n" + "="*70)
-        print("EXPERIMENT SUMMARY")
-        print("="*70)
-        print(f"Backend: {self.config['backend'].upper()}")
-        print(f"Total runs: {len(all_results)}")
-        print(f"Success rate: {success_count/len(all_results)*100:.1f}% ({success_count}/{len(all_results)})")
-        print(f"Avg steps (successful): {avg_steps:.1f}")
+        exp_num = 0
+        for start in start_pages:
+            for personality in personalities:
+                for i in range(iterations):
+                    exp_num += 1
+                    logging.info(f"Experiment {exp_num}/{total}: {start} -> {target} | {personality} | Run {i+1}")
+                    print(f"[{exp_num}/{total}] {start} -> {target} | {personality} (Run {i+1}/{iterations})")
+                    
+                    result = self.navigate(start, target, personality)
+                    all_results.append(result)
+                    
+                    if result['success']:
+                        success_count += 1
+                    
+                    self.save_result(result, start, personality, i + 1)
+        
+        self.save_edges_csv()
+        self.save_summary(all_results)
+        
+        success_rate = success_count / len(all_results) * 100 if all_results else 0
+        logging.info(f"Experiments completed: {success_count}/{len(all_results)} ({success_rate:.1f}%)")
+        
+        print(f"\nCompleted {len(all_results)} experiments")
+        print(f"Success rate: {success_count}/{len(all_results)} ({success_rate:.1f}%)")
         print(f"Results saved in: {self.config['output_dir']}")
-        print("="*70 + "\n")
 
-        logging.info(f"Completed {len(all_results)} iterations. Individual results saved in: {self.config['output_dir']}")
-        return all_results
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     navigator = WikiNavigator()
     navigator.run_experiments()
