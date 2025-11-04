@@ -17,6 +17,7 @@ class WikiNavigator:
         self.cache_dir.mkdir(exist_ok=True)
         self.llm = None
         self.all_edges = []
+        self.total_input_tokens = 0
         self._setup_logging()
         
     def _load_config(self, config_file):
@@ -199,6 +200,9 @@ ws ::= [ \\t\\n]*''')
     def navigate(self, start, target, personality='baseline'):
         self._init_llm()
         
+        # Reset token counter for this navigation
+        self.total_input_tokens = 0
+        
         current, path, visited = start, [start], {start.lower()}
         detailed_steps, corrections_used = [], 0
         recent_transitions = []
@@ -222,12 +226,14 @@ ws ::= [ \\t\\n]*''')
                     'success': False, 'steps': step, 'path': path, 'detailed_steps': detailed_steps,
                     'start': start, 'target': target, 'personality': personality,
                     'error_type': 'dead_end', 'time': (datetime.now() - start_time).total_seconds(),
-                    'corrections_used': corrections_used, 'loop_detected': False
+                    'corrections_used': corrections_used, 'loop_detected': False,
+                    'total_input_tokens': self.total_input_tokens
                 }
             
             logging.info(f"Available links: {len(available)}")
             grammar = self.create_grammar(available)
             chosen, reason = None, ""
+            step_input_tokens = []  # Track tokens for each attempt in this step
             
             for attempt in range(self.config['max_correction_attempts']):
                 prompt = self.create_navigation_prompt(current, target, path, content, available) if attempt == 0 \
@@ -236,6 +242,12 @@ ws ::= [ \\t\\n]*''')
                 if attempt > 0:
                     corrections_used += 1
                     logging.info(f"Correction attempt {attempt}")
+                
+                # Count input tokens
+                input_tokens = len(self.llm.tokenize(prompt.encode('utf-8')))
+                step_input_tokens.append(input_tokens)
+                self.total_input_tokens += input_tokens
+                logging.info(f"Input tokens: {input_tokens} (Total: {self.total_input_tokens})")
                 
                 output = self.llm(prompt, max_tokens=2048, grammar=grammar)
                 chosen, reason = self.parse_response(output['choices'][0]['text'].strip())
@@ -252,7 +264,8 @@ ws ::= [ \\t\\n]*''')
                     'success': False, 'steps': step, 'path': path, 'detailed_steps': detailed_steps,
                     'start': start, 'target': target, 'personality': personality,
                     'error_type': 'invalid_link', 'time': (datetime.now() - start_time).total_seconds(),
-                    'corrections_used': corrections_used, 'loop_detected': False
+                    'corrections_used': corrections_used, 'loop_detected': False,
+                    'total_input_tokens': self.total_input_tokens
                 }
             
             available_links_map = {link: link for link in available}
@@ -260,6 +273,7 @@ ws ::= [ \\t\\n]*''')
             detailed_steps.append({
                 'step': step, 'from': current, 'to': chosen, 'reason': reason,
                 'available_links': len(available), 'corrections': attempt,
+                'input_tokens': step_input_tokens,  # List of tokens for each attempt
                 'available_links_map': available_links_map
             })
             
@@ -276,15 +290,25 @@ ws ::= [ \\t\\n]*''')
                     'success': False, 'steps': step, 'path': path, 'detailed_steps': detailed_steps,
                     'start': start, 'target': target, 'personality': personality,
                     'error_type': 'loop_detected', 'time': (datetime.now() - start_time).total_seconds(),
-                    'corrections_used': corrections_used, 'loop_detected': True
+                    'corrections_used': corrections_used, 'loop_detected': True,
+                    'total_input_tokens': self.total_input_tokens
                 }
             
             status, result = self.get_wikipedia_page(chosen)
             if status == 'disambiguation':
                 logging.info(f"Resolving disambiguation for: {chosen}")
                 prompt = self.create_disambiguation_prompt(chosen, target, path, result)
+                
+                # Count input tokens
+                input_tokens = len(self.llm.tokenize(prompt.encode('utf-8')))
+                self.total_input_tokens += input_tokens
+                logging.info(f"Input tokens (disambiguation): {input_tokens} (Total: {self.total_input_tokens})")
+                
+                # Add disambiguation tokens to the last step
+                detailed_steps[-1]['disambiguation_tokens'] = input_tokens
+                
                 output = self.llm(prompt, max_tokens=2048, grammar=self.create_grammar(result))
-                chosen, _ = self.parse_response(output['choices'][0]['text'].strip())
+                chosen, reason = self.parse_response(output['choices'][0]['text'].strip())
                 logging.info(f"Disambiguation resolved to: {chosen}")
                 status, result = self.get_wikipedia_page(chosen)
             
@@ -295,13 +319,14 @@ ws ::= [ \\t\\n]*''')
         
         elapsed = (datetime.now() - start_time).total_seconds()
         logging.info(f"SUCCESS! Reached target in {step} steps ({elapsed:.1f}s)")
-        print(f"  SUCCESS in {step} steps ({elapsed:.1f}s)")
+        logging.info(f"Total input tokens used: {self.total_input_tokens}")
+        print(f"  SUCCESS in {step} steps ({elapsed:.1f}s) - Input tokens: {self.total_input_tokens}")
         
         return {
             'success': True, 'steps': step, 'path': path, 'detailed_steps': detailed_steps,
             'start': start, 'target': target, 'personality': personality,
             'error_type': None, 'time': elapsed, 'corrections_used': corrections_used,
-            'loop_detected': False
+            'loop_detected': False, 'total_input_tokens': self.total_input_tokens
         }
     
     def save_result(self, result, start_page, personality, iteration):
@@ -326,10 +351,14 @@ ws ::= [ \\t\\n]*''')
             json.dump(result_copy, f, indent=2, ensure_ascii=False)
         
         with open(output_dir / f"result_{iteration:03d}_steps.csv", 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=['step', 'from', 'to', 'reason', 'available_links', 'corrections'])
+            writer = csv.DictWriter(f, fieldnames=['step', 'from', 'to', 'reason', 'available_links', 'corrections', 'input_tokens', 'disambiguation_tokens'])
             writer.writeheader()
             for step in result_copy['detailed_steps']:
-                writer.writerow({k: v for k, v in step.items() if k != 'available_links_map'})
+                row = {k: v for k, v in step.items() if k != 'available_links_map'}
+                # Convert input_tokens list to string for CSV
+                if 'input_tokens' in row:
+                    row['input_tokens'] = ','.join(map(str, row['input_tokens']))
+                writer.writerow(row)
         
         logging.info(f"Saved result {iteration} for {start_page}/{personality}")
     

@@ -41,6 +41,7 @@ class WikiNavigator:
         self.cache_dir.mkdir(exist_ok=True)
         self.llm = None
         self.all_edges = []
+        self.total_input_tokens = 0
         self._setup_logging()
         
     def _load_config(self, config_file):
@@ -190,6 +191,9 @@ ws ::= [ \\t\\n]*''')
         """Esplora Wikipedia liberamente partendo da una pagina per max_steps passi."""
         self._init_llm()
         
+        # Reset token counter for this exploration
+        self.total_input_tokens = 0
+        
         current = start_page
         path = [start_page]
         visited = {start_page.lower()}
@@ -223,6 +227,11 @@ ws ::= [ \\t\\n]*''')
             # Genera grammar per forzare una scelta valida
             grammar = self.create_grammar(available)
             
+            # Count input tokens
+            input_tokens = len(self.llm.tokenize(prompt.encode('utf-8')))
+            self.total_input_tokens += input_tokens
+            logging.info(f"Input tokens: {input_tokens} (Total: {self.total_input_tokens})")
+            
             # Chiedi all'LLM di scegliere
             output = self.llm(prompt, max_tokens=512, grammar=grammar)
             chosen, reason = self.parse_response(output['choices'][0]['text'].strip())
@@ -243,6 +252,7 @@ ws ::= [ \\t\\n]*''')
                 'to': chosen,
                 'reason': reason,
                 'available_links': len(available),
+                'input_tokens': input_tokens,  # Save tokens for this step
                 'available_links_map': available_links_map
             })
             
@@ -265,6 +275,7 @@ ws ::= [ \\t\\n]*''')
         
         elapsed = (datetime.now() - start_time).total_seconds()
         logging.info(f"Exploration completed: {len(path)} pages visited in {elapsed:.1f}s")
+        logging.info(f"Total input tokens used: {self.total_input_tokens}")
         
         return {
             'start': start_page,
@@ -272,7 +283,8 @@ ws ::= [ \\t\\n]*''')
             'path': path,
             'steps_data': steps_data,
             'time': elapsed,
-            'unique_pages': len(visited)
+            'unique_pages': len(visited),
+            'total_input_tokens': self.total_input_tokens
         }
     
     def save_result(self, result, run_number):
@@ -301,7 +313,7 @@ ws ::= [ \\t\\n]*''')
         
         # Salva CSV con i passi
         with open(output_dir / f"exploration_{run_number:03d}_steps.csv", 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=['step', 'from', 'to', 'reason', 'available_links'])
+            writer = csv.DictWriter(f, fieldnames=['step', 'from', 'to', 'reason', 'available_links', 'input_tokens'])
             writer.writeheader()
             for step in result_copy['steps_data']:
                 writer.writerow(step)

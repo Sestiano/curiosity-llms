@@ -1,0 +1,157 @@
+{
+  "joyous_exploration": {
+    "name": "Joyous Exploration",
+    "reverse_scored": false,
+    "items": [
+      {
+        "item_number": 1,
+        "item_text": "I view challenging situations as an opportunity to grow and learn.",
+        "rating": 4
+      },
+      {
+        "item_number": 2,
+        "item_text": "I am always looking for experiences that challenge how I think about myself and the world.",
+        "rating": 5
+      },
+      {
+        "item_number": 3,
+        "item_text": "I seek out situations where it is likely that I will have to think in depth about something.",
+        "rating": 5
+      },
+      {
+        "item_number": 4,
+        "item_text": "I enjoy learning about subjects that are unfamiliar to me.",
+        "rating": 5
+      },
+      {
+        "item_number": 5,
+        "item_text": "I find it fascinating to learn new information.",
+        "rating": 5
+      }
+    ]
+  },
+  "deprivation_sensitivity": {
+    "name": "Deprivation Sensitivity",
+    "reverse_scored": false,
+    "items": [
+      {
+        "item_number": 6,
+        "item_text": "Thinking about solutions to difficult conceptual problems can keep me awake at night.",
+        "rating": 5
+      },
+      {
+        "item_number": 7,
+        "item_text": "I can spend hours on a single problem because I just can't rest without knowing the answer.",
+        "rating": 1
+      },
+      {
+        "item_number": 8,
+        "item_text": "I feel frustrated if I can't figure out the solution to a problem, so I work even harder to solve it.",
+        "rating": 1
+      },
+      {
+        "item_number": 9,
+        "item_text": "I work relentlessly at problems that I feel must be solved.",
+        "rating": 6
+      },
+      {
+        "item_number": 10,
+        "item_text": "It frustrates me not having all the information I need.",
+        "rating": 5
+      }
+    ]
+  },
+  "stress_tolerance": {
+    "name": "Stress Tolerance",
+    "reverse_scored": true,
+    "items": [
+      {
+        "item_number": 11,
+        "item_text": "The smallest doubt can stop me from seeking out new experiences.",
+        "rating": 5
+      },
+      {
+        "item_number": 12,
+        "item_text": "I cannot handle the stress that comes from entering uncertain situations.",
+        "rating": 5
+      },
+      {
+        "item_number": 13,
+        "item_text": "I find it hard to explore new places when I lack confidence in my abilities.",
+        "rating": 5
+      },
+      {
+        "item_number": 14,
+        "item_text": "I cannot function well if I am unsure whether a new experience is safe.",
+        "rating": 1
+      },
+      {
+        "item_number": 15,
+        "item_text": "It is difficult to concentrate when there is a possibility that I will be taken by surprise.",
+        "rating": 1
+      }
+    ]
+  },
+  "social_curiosity": {
+    "name": "Social Curiosity",
+    "reverse_scored": false,
+    "items": [
+      {
+        "item_number": 16,
+        "item_text": "I like to learn about the habits of others.",
+        "rating": 5
+      },
+      {
+        "item_number": 17,
+        "item_text": "I like finding out why people behave the way they do.",
+        "rating": 1
+      },
+      {
+        "item_number": 18,
+        "item_text": "When other people are having a conversation, I like to find out what it's about.",
+        "rating": 4
+      },
+      {
+        "item_number": 19,
+        "item_text": "When around other people, I like listening to their conversations.",
+        "rating": 5
+      },
+      {
+        "item_number": 20,
+        "item_text": "When people quarrel, I like to know what's going on.",
+        "rating": 1
+      }
+    ]
+  },
+  "thrill_seeking": {
+    "name": "Thrill Seeking",
+    "reverse_scored": false,
+    "items": [
+      {
+        "item_number": 21,
+        "item_text": "The anxiety of doing something new makes me feel excited and alive.",
+        "rating": 5
+      },
+      {
+        "item_number": 22,
+        "item_text": "Risk-taking is exciting to me.",
+        "rating": 5
+      },
+      {
+        "item_number": 23,
+        "item_text": "When I have free time, I want to do things that are a little scary.",
+        "rating": 5
+      },
+      {
+        "item_number": 24,
+        "item_text": "Creating an adventure as I go is much more appealing than a planned adventure.",
+        "rating": 5
+      },
+      {
+        "item_number": 25,
+        "item_text": "I prefer friends who are excitingly unpredictable.",
+        "rating": 5
+      }
+    ]
+  }
+}
