@@ -1,0 +1,9 @@
+{
+  "model_path": "../models/mistral-7b-instruct-v0.2.Q4_K_M.gguf",
+  "n_gpu_layers": -1,
+  "n_ctx": 24000,
+  "start_page": "Wikipedia",
+  "max_steps": 10,
+  "runs": 5,
+  "output_dir": "results"
+}
