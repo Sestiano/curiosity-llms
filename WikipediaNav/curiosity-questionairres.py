@@ -1,5 +1,6 @@
 from llama_cpp import Llama, LlamaGrammar
 import json
+import numpy as np
 
 # Scala Likert per i questionari sulla curiosità
 Scale = {
@@ -158,6 +159,123 @@ def evaluate_all_items(llm_model, output_file="curiosity_results.json"):
     
     return all_results
 
+
+def calculate_dimension_scores(results):
+    """
+    Calcola i punteggi medi per ogni dimensione secondo Kashdan et al. (2018).
+    
+    Returns:
+        dict: Punteggi da 1-7 per ogni dimensione + percentile sample
+    """
+    scores = {}
+    
+    for dim_key, dimension in results.items():
+        ratings = [item["rating"] for item in dimension["items"]]
+        
+        # Applica reverse scoring SOLO per stress_tolerance
+        if dimension.get("reverse_scored", False):
+            ratings = [8 - r for r in ratings]  # 8-x inverte la scala 1-7
+        
+        mean_score = sum(ratings) / len(ratings)
+        
+        scores[dim_key] = {
+            "name": dimension["name"],
+            "mean_score": mean_score,
+            "raw_ratings": ratings,
+            # Calcola anche deviazione standard per robustezza
+            "std": np.std(ratings),
+            # Normalizza in POMP (Percentage of Maximum Possible) come negli studi
+            "pomp": ((mean_score - 1) / 6) * 100  # da scala 1-7 a 0-100%
+        }
+    
+    return scores
+
+
+def _add_secondary_modifiers(profile, scores):
+    """Aggiungi modifiche basate su altre dimensioni (effetto più debole)."""
+    
+    # Stress Tolerance: alto → più disposto a esplorare incerto
+    if scores["stress_tolerance"]["mean_score"] >= 5.0:
+        profile["system_prompt_additions"].append(
+            "You handle uncertainty well - don't hesitate to explore unfamiliar territory."
+        )
+    elif scores["stress_tolerance"]["mean_score"] <= 3.0:
+        profile["system_prompt_additions"].append(
+            "Build confidence gradually - start with familiar concepts before venturing far."
+        )
+    
+    # Joyous Exploration: influenza l'entusiasmo
+    if scores["joyous_exploration"]["mean_score"] >= 5.0:
+        profile["system_prompt_additions"].append(
+            "Express genuine enthusiasm for discovering new information."
+        )
+    
+    # Social Curiosity: focus su people-related topics
+    if scores["social_curiosity"]["mean_score"] >= 5.0:
+        profile["system_prompt_additions"].append(
+            "When relevant, prioritize information about people, social phenomena, and human behavior."
+        )
+
+
+def assign_navigation_style_scientific(scores):
+    """
+    Assegna stile di navigazione basato su evidenze da Lydon-Staley et al. (2021).
+    
+    Focus su Deprivation Sensitivity come predittore principale dello stile.
+    """
+    profile = {
+        "deprivation_score": scores["deprivation_sensitivity"]["mean_score"],
+        "deprivation_pomp": scores["deprivation_sensitivity"]["pomp"],
+        "navigation_style": None,
+        "reinforcement_tendency": None,
+        "regularity_preference": None,
+        "system_prompt_additions": []
+    }
+    
+    ds_score = scores["deprivation_sensitivity"]["mean_score"]
+    
+    # Soglie basate su distribuzioni degli studi (media campione ≈ 4.0, SD ≈ 1.1)
+    # Alta DS: > media + 0.5 SD (≈ 4.5+)
+    # Bassa DS: < media - 0.5 SD (≈ 3.5-)
+    
+    if ds_score >= 4.5:
+        profile["navigation_style"] = "hunter"
+        profile["reinforcement_tendency"] = "high"  # Torna spesso su pagine visitate
+        profile["regularity_preference"] = "short_steps"  # Preferisce concetti vicini
+        profile["system_prompt_additions"].extend([
+            "When you encounter a knowledge gap, pursue closely related concepts systematically.",
+            "Revisit previous topics to build deeper understanding before moving to new areas.",
+            "Focus on eliminating uncertainty about specific topics through targeted exploration.",
+            "Prefer depth over breadth - exhaust related concepts before large conceptual jumps."
+        ])
+        
+    elif ds_score <= 3.5:
+        profile["navigation_style"] = "busybody"
+        profile["reinforcement_tendency"] = "low"
+        profile["regularity_preference"] = "long_jumps"  # Salta tra concetti distanti
+        profile["system_prompt_additions"].extend([
+            "Sample diverse concepts without dwelling on any single topic for too long.",
+            "Make surprising conceptual leaps between distant topics.",
+            "Prioritize breadth of exploration over systematic depth.",
+            "Follow whatever sparks immediate interest, even if unrelated to previous topics."
+        ])
+    
+    else:
+        profile["navigation_style"] = "mixed"
+        profile["reinforcement_tendency"] = "moderate"
+        profile["regularity_preference"] = "balanced"
+        profile["system_prompt_additions"].extend([
+            "Balance systematic exploration with occasional diverse jumps.",
+            "Return to previous concepts when uncertainty arises, but also explore new areas.",
+            "Adapt your strategy based on the information encountered."
+        ])
+    
+    # Aggiungi modificatori dalle altre dimensioni (meno peso)
+    _add_secondary_modifiers(profile, scores)
+    
+    return profile
+
+
 # Esempio di utilizzo
 if __name__ == "__main__":
     # Carica il modello (modifica il path secondo necessità)
@@ -178,4 +296,39 @@ if __name__ == "__main__":
     
     print("\n=== Evaluation Complete ===")
     print(f"Total items evaluated: 25")
-
+    
+    # Calcola i punteggi per dimensione
+    print("\n=== Calculating Dimension Scores ===")
+    scores = calculate_dimension_scores(results)
+    
+    print("\nDimension Scores:")
+    for dim_key, dim_data in scores.items():
+        print(f"\n{dim_data['name']}:")
+        print(f"  Mean Score: {dim_data['mean_score']:.2f}/7")
+        print(f"  POMP: {dim_data['pomp']:.1f}%")
+        print(f"  Std Dev: {dim_data['std']:.2f}")
+    
+    # Assegna lo stile di navigazione basato sui punteggi
+    print("\n=== Assigning Navigation Style ===")
+    navigation_profile = assign_navigation_style_scientific(scores)
+    
+    print(f"\nNavigation Style: {navigation_profile['navigation_style'].upper()}")
+    print(f"Deprivation Sensitivity Score: {navigation_profile['deprivation_score']:.2f}/7")
+    print(f"Reinforcement Tendency: {navigation_profile['reinforcement_tendency']}")
+    print(f"Regularity Preference: {navigation_profile['regularity_preference']}")
+    
+    print("\nSystem Prompt Additions:")
+    for i, addition in enumerate(navigation_profile['system_prompt_additions'], 1):
+        print(f"  {i}. {addition}")
+    
+    # Salva il profilo completo
+    complete_profile = {
+        "dimension_scores": scores,
+        "navigation_profile": navigation_profile
+    }
+    
+    profile_file = "navigation_profile.json"
+    with open(profile_file, 'w', encoding='utf-8') as f:
+        json.dump(complete_profile, f, indent=2, ensure_ascii=False)
+    
+    print(f"\n✓ Complete profile saved to {profile_file}")

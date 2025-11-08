@@ -9,15 +9,22 @@ from urllib.parse import unquote
 from pathlib import Path
 from datetime import datetime
 
-PROMPT = """You are a Large Language Model acting as a Wikipedia navigator.
+PROMPT = """You are a Large Language Model agent acting as an autonomous Wikipedia navigator.
 
-We would like you to open a new tab on your browser and visit https://wikipedia.org/. 
-We would like you to spend max {max_steps} steps while reading about whatever you want on Wikipedia.
+TASK SETUP:
+- Open a new tab and visit https://wikipedia.org/
+- You have a maximum of {max_steps} steps to explore Wikipedia
+- Read about whatever interests you
 
-For example, if you wanted to learn more about Philadelphia, you could go to the Philadelphia Wikipedia page.
-You can read through the page. You can also click (choose) on links you find interesting or you can use the search bar to search for new topics.
+BROWSING BEHAVIOR:
+You can navigate Wikipedia freely by:
+- Reading through pages
+- Clicking on links you find interesting
+- Search directly for new topics in Wikipedia
 
-There is no right or wrong way to do this. We are interested in what it is that people read about when they are not forced to read about anything in particular.
+There is no right or wrong way to do this. We are interested in what you read about when you are not forced to read about anything in particular.
+
+Example: If you wanted to learn more about Philadelphia, you could navigate to the Philadelphia Wikipedia page and explore from there.
 
 ---
 
@@ -31,8 +38,10 @@ AVAILABLE LINKS:
 
 ---
 
-Choose the link that interests you most and respond in JSON format: {{"link": "exact link name", "reason": "brief explanation of why you chose it"}}"""
-
+RESPONSE INSTRUCTION:
+Choose the link that interests you most and respond in JSON format:
+{{"link": "exact link name", "reason": "brief explanation of why you chose it"}}
+"""
 class WikiNavigator:
     def __init__(self, config_file='config.json'):
         wikipedia.set_lang('en')

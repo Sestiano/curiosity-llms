@@ -1,0 +1,81 @@
+{
+  "dimension_scores": {
+    "joyous_exploration": {
+      "name": "Joyous Exploration",
+      "mean_score": 4.8,
+      "raw_ratings": [
+        4,
+        5,
+        5,
+        5,
+        5
+      ],
+      "std": 0.39999999999999997,
+      "pomp": 63.33333333333333
+    },
+    "deprivation_sensitivity": {
+      "name": "Deprivation Sensitivity",
+      "mean_score": 3.6,
+      "raw_ratings": [
+        5,
+        1,
+        1,
+        6,
+        5
+      ],
+      "std": 2.154065922853802,
+      "pomp": 43.333333333333336
+    },
+    "stress_tolerance": {
+      "name": "Stress Tolerance",
+      "mean_score": 4.6,
+      "raw_ratings": [
+        3,
+        3,
+        3,
+        7,
+        7
+      ],
+      "std": 1.9595917942265424,
+      "pomp": 60.0
+    },
+    "social_curiosity": {
+      "name": "Social Curiosity",
+      "mean_score": 3.2,
+      "raw_ratings": [
+        5,
+        1,
+        4,
+        5,
+        1
+      ],
+      "std": 1.8330302779823358,
+      "pomp": 36.66666666666667
+    },
+    "thrill_seeking": {
+      "name": "Thrill Seeking",
+      "mean_score": 5.0,
+      "raw_ratings": [
+        5,
+        5,
+        5,
+        5,
+        5
+      ],
+      "std": 0.0,
+      "pomp": 66.66666666666666
+    }
+  },
+  "navigation_profile": {
+    "deprivation_score": 3.6,
+    "deprivation_pomp": 43.333333333333336,
+    "navigation_style": "mixed",
+    "reinforcement_tendency": "moderate",
+    "regularity_preference": "balanced",
+    "system_prompt_additions": [
+      "Balance systematic exploration with occasional diverse jumps.",
+      "Return to previous concepts when uncertainty arises, but also explore new areas.",
+      "Adapt your strategy based on the information encountered."
+    ]
+  }
+}
